@@ -4,7 +4,12 @@ from datetime import datetime, timezone
 from typing import Optional
 
 import aiohttp
-import feedparser
+try:
+    import feedparser
+    _FEEDPARSER_AVAILABLE = True
+except ImportError:
+    feedparser = None  # type: ignore
+    _FEEDPARSER_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -146,6 +151,8 @@ def _categorize(title: str, summary: str) -> str:
 
 async def _fetch_feed(session: aiohttp.ClientSession, source: str, url: str) -> list[dict]:
     """Fetch and parse a single RSS feed asynchronously."""
+    if not _FEEDPARSER_AVAILABLE:
+        return []
     try:
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
             text = await resp.text()
