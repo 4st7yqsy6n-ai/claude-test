@@ -3,13 +3,14 @@ import { useMarketStore } from '@/stores/marketStore';
 import clsx from 'clsx';
 import type { Timeframe } from '@/types';
 
-const TIMEFRAMES: Timeframe[] = ['1D', '1W', '1M', '3M', '1Y', '5Y'];
+const TIMEFRAMES: Timeframe[] = ['1D', '1W', '1M', '3M', '6M', '1Y', '5Y'];
 
 const TIMEFRAME_TV_MAP: Record<Timeframe, string> = {
   '1D': 'D',
   '1W': 'W',
   '1M': 'M',
   '3M': '3M',
+  '6M': '6M',
   '1Y': '12M',
   '5Y': '60M',
 };

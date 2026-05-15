@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { useScreenerMovers, useHeatmapData } from '@/hooks/useMarketData';
 import { useMarketStore } from '@/stores/marketStore';
-import type { ScreenerResult, SectorData } from '@/types';
+import type { ScreenerResult } from '@/types';
 import clsx from 'clsx';
 
 function formatLargeNumber(n: number): string {

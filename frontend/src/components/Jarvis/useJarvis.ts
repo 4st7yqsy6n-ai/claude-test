@@ -37,7 +37,8 @@ export function useJarvis() {
   const [volume, setVolume] = useState(0)
   const [alwaysListening, setAlwaysListening] = useState(false)
 
-  const recognitionRef = useRef<SpeechRecognition | null>(null)
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const recognitionRef = useRef<any>(null)
   const synthRef = useRef(window.speechSynthesis)
   const analyserRef = useRef<AnalyserNode | null>(null)
   const animFrameRef = useRef<number>(0)
@@ -47,8 +48,8 @@ export function useJarvis() {
   const { setSelectedSymbol } = useMarketStore()
 
   useEffect(() => {
-    const SpeechRecognition =
-      window.SpeechRecognition || (window as any).webkitSpeechRecognition
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition
     if (SpeechRecognition) {
       setIsSupported(true)
       const recognition = new SpeechRecognition()
@@ -56,7 +57,8 @@ export function useJarvis() {
       recognition.interimResults = true
       recognition.lang = 'en-US'
 
-      recognition.onresult = (event) => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      recognition.onresult = (event: any) => {
         let interim = ''
         let final = ''
         for (let i = event.resultIndex; i < event.results.length; i++) {

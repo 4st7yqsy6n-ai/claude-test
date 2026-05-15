@@ -1,6 +1,6 @@
 import { useRef, useEffect, useState } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
-import { Mic, MicOff, Volume2, Brain, X, ChevronDown, ChevronUp } from 'lucide-react'
+import { Mic, Volume2, Brain, X, ChevronDown, ChevronUp } from 'lucide-react'
 import { useJarvis, JarvisState } from './useJarvis'
 
 const STATE_COLORS: Record<JarvisState, string> = {
