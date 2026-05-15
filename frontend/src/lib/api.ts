@@ -15,7 +15,8 @@ import type {
 // ─── Axios Instance ───────────────────────────────────────────────────────────
 
 const api = axios.create({
-  baseURL: import.meta.env.VITE_API_URL || 'http://localhost:8000',
+  // Empty string = relative URLs (same host, combined deployment). Falls back to localhost for dev.
+  baseURL: import.meta.env.VITE_API_URL ?? 'http://localhost:8000',
   timeout: 15000,
   headers: {
     'Content-Type': 'application/json',

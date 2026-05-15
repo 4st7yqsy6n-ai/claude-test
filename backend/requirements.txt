@@ -13,3 +13,4 @@ aiohttp==3.10.5
 cachetools==5.5.0
 pytz==2024.2
 scipy==1.14.0
+aiofiles==24.1.0

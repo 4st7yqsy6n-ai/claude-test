@@ -2,7 +2,14 @@ import { useEffect, useRef, useCallback } from 'react';
 import { useMarketStore } from '@/stores/marketStore';
 import type { WSMessage, WSPriceUpdate } from '@/types';
 
-const WS_URL = import.meta.env.VITE_WS_URL || 'ws://localhost:8000/ws';
+function getWsUrl() {
+  if (import.meta.env.VITE_WS_URL) return import.meta.env.VITE_WS_URL;
+  const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const apiUrl = import.meta.env.VITE_API_URL;
+  if (apiUrl) return apiUrl.replace(/^https?:/, proto) + '/ws';
+  return `${proto}//${window.location.host}/ws`;
+}
+const WS_URL = getWsUrl();
 const RECONNECT_DELAY = 3000;
 const HEARTBEAT_INTERVAL = 30000;
 

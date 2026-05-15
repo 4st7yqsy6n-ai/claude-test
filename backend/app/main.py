@@ -1,11 +1,15 @@
 import asyncio
 import json
 import logging
+import os
 import random
 from datetime import datetime, timezone
+from pathlib import Path
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 
 from app.config import settings
 from app.routers import ai_router, macro, market, news, screener
@@ -215,5 +219,22 @@ def health_check():
 
 @app.get("/")
 def root():
-    """Root endpoint."""
+    """Root endpoint — serve SPA index if built frontend exists, else JSON."""
+    index = Path(__file__).parent.parent / "static" / "index.html"
+    if index.exists():
+        return FileResponse(str(index))
     return {"status": "QuantEcosystem API running"}
+
+
+# ── Static files (built frontend) ─────────────────────────────────────────────
+# Mount AFTER all API/WS routes so /api/* is never swallowed by the static handler.
+_static_dir = Path(__file__).parent.parent / "static"
+if _static_dir.exists():
+    # Serve assets
+    app.mount("/assets", StaticFiles(directory=str(_static_dir / "assets")), name="assets")
+
+    # SPA catch-all — any path that isn't /api or /ws returns index.html
+    @app.get("/{full_path:path}")
+    def spa_fallback(full_path: str):
+        index = _static_dir / "index.html"
+        return FileResponse(str(index))
