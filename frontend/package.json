@@ -1,0 +1,33 @@
+{
+  "name": "quant-ecosystem",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "recharts": "^2.12.7",
+    "zustand": "^4.5.5",
+    "axios": "^1.7.7",
+    "@tanstack/react-query": "^5.56.2",
+    "react-resizable-panels": "^2.1.3",
+    "framer-motion": "^11.5.4",
+    "date-fns": "^3.6.0",
+    "clsx": "^2.1.1",
+    "lucide-react": "^0.441.0"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.5",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react": "^4.3.1",
+    "typescript": "^5.5.3",
+    "vite": "^5.4.2",
+    "tailwindcss": "^3.4.10",
+    "postcss": "^8.4.44",
+    "autoprefixer": "^10.4.20"
+  }
+}
