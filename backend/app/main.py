@@ -212,7 +212,7 @@ def health_check():
         "version": "1.0.0",
         "services": {
             "anthropic": "configured" if settings.has_anthropic_key else "mock mode",
-            "fred": "configured" if settings.has_fred_key else "mock mode",
+            "macro": "live (Treasury + BLS + yfinance)",
         },
     }
 
