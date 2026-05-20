@@ -1,5 +1,5 @@
 import { useQuery } from '@tanstack/react-query';
-import { fetchMacroIndicators, fetchYieldCurve, fetchNews, getEconomicCalendar } from '@/lib/api';
+import { fetchMacroIndicators, fetchYieldCurve, fetchNews, getEconomicCalendar, fetchWorldIndices } from '@/lib/api';
 import type { NewsCategory } from '@/types';
 
 export function useMacroIndicators() {
@@ -38,6 +38,16 @@ export function useEconomicCalendar() {
     queryFn: getEconomicCalendar,
     refetchInterval: 15 * 60_000,
     staleTime: 5 * 60_000,
+    retry: false,
+  });
+}
+
+export function useWorldIndices() {
+  return useQuery({
+    queryKey: ['market', 'world'],
+    queryFn: fetchWorldIndices,
+    refetchInterval: 60_000,
+    staleTime: 30_000,
     retry: false,
   });
 }
