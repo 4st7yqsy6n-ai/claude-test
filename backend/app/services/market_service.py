@@ -2,13 +2,39 @@ import logging
 from datetime import datetime, timezone
 from typing import Any
 
-import numpy as np
-import pandas as pd
-import yfinance as yf
-from cachetools import TTLCache, cached
+from cachetools import TTLCache
 from cachetools.keys import hashkey
 
 logger = logging.getLogger(__name__)
+
+# Heavy scientific packages loaded lazily on first use to minimise startup RAM
+_np = None
+_pd = None
+_yf = None
+
+
+def _numpy():
+    global _np
+    if _np is None:
+        import numpy as np
+        _np = np
+    return _np
+
+
+def _pandas():
+    global _pd
+    if _pd is None:
+        import pandas as pd
+        _pd = pd
+    return _pd
+
+
+def _yfinance():
+    global _yf
+    if _yf is None:
+        import yfinance as yf
+        _yf = yf
+    return _yf
 
 # ---------------------------------------------------------------------------
 # Cache – 60-second TTL for market data
@@ -73,7 +99,7 @@ MOCK_PRICES: dict[str, dict] = {
 def _safe_float(val: Any, default: float = 0.0) -> float:
     """Convert a value to float, returning default on failure."""
     try:
-        if val is None or (isinstance(val, float) and np.isnan(val)):
+        if val is None or (isinstance(val, float) and _numpy().isnan(val)):
             return default
         return float(val)
     except (TypeError, ValueError):
@@ -83,7 +109,7 @@ def _safe_float(val: Any, default: float = 0.0) -> float:
 def _fetch_quote(symbol: str) -> dict:
     """Fetch a single symbol quote, fallback to mock on error."""
     try:
-        ticker = yf.Ticker(symbol)
+        ticker = _yfinance().Ticker(symbol)
         info = ticker.fast_info
         price = _safe_float(getattr(info, "last_price", None))
         prev_close = _safe_float(getattr(info, "previous_close", None))
@@ -137,11 +163,11 @@ def get_ohlcv(symbol: str, period: str = "1y", interval: str = "1d") -> list[dic
         return _ohlcv_cache[cache_key]
 
     try:
-        df = yf.download(symbol, period=period, interval=interval, auto_adjust=True, progress=False)
+        df = _yfinance().download(symbol, period=period, interval=interval, auto_adjust=True, progress=False)
         if df.empty:
             raise ValueError("empty dataframe")
         # Flatten multi-level columns that yfinance sometimes returns
-        if isinstance(df.columns, pd.MultiIndex):
+        if isinstance(df.columns, _pandas().MultiIndex):
             df.columns = df.columns.get_level_values(0)
         df = df.dropna(subset=["Close"])
         records = []
@@ -163,6 +189,8 @@ def get_ohlcv(symbol: str, period: str = "1y", interval: str = "1d") -> list[dic
 
 def _generate_mock_ohlcv(symbol: str, period: str) -> list[dict]:
     """Generate a realistic mock OHLCV series."""
+    np = _numpy()
+    pd = _pandas()
     base = MOCK_PRICES.get(symbol, {}).get("price", 100.0)
     n_days = {"1d": 1, "5d": 5, "1mo": 22, "3mo": 63, "6mo": 126, "1y": 252, "2y": 504, "5y": 1260}.get(period, 252)
     rng = np.random.default_rng(abs(hash(symbol)) % (2**31))
@@ -245,12 +273,13 @@ def get_ticker_info(symbol: str) -> dict:
 # Technical indicators
 # ---------------------------------------------------------------------------
 
-def calculate_indicators(df: pd.DataFrame) -> dict:
+def calculate_indicators(df) -> dict:
     """
     Calculate RSI(14), MACD, Bollinger Bands, EMA20, EMA50, EMA200
     from a DataFrame with a 'close' column.
     Returns dict with indicator series as lists ready for JSON serialisation.
     """
+    np = _numpy()
     if df.empty or "close" not in df.columns:
         return {}
 
@@ -284,7 +313,7 @@ def calculate_indicators(df: pd.DataFrame) -> dict:
     bb_upper = bb_mid + 2 * bb_std
     bb_lower = bb_mid - 2 * bb_std
 
-    def _series_to_list(s: pd.Series) -> list:
+    def _series_to_list(s) -> list:
         return [round(v, 6) if not np.isnan(v) else None for v in s.tolist()]
 
     return {
