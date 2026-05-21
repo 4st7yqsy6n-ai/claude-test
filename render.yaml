@@ -6,6 +6,5 @@ services:
     envVars:
       - key: ANTHROPIC_API_KEY
         sync: false
-      - key: FRED_API_KEY
-        sync: false
     healthCheckPath: /health
+    autoDeploy: true
