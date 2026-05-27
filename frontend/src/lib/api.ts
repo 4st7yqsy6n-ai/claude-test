@@ -238,4 +238,214 @@ export async function getEconomicCalendar(): Promise<EconomicEvent[]> {
   }
 }
 
+// VIP API types and functions
+export interface VIPRegime {
+  risk_sentiment: 'risk_off' | 'risk_on' | 'neutral';
+  risk_score: number;
+  inflation_regime: 'high_inflation' | 'disinflation' | 'deflation' | 'stable';
+  inflation_score: number;
+  usd_cycle: 'strong_dollar' | 'weak_dollar' | 'neutral';
+  usd_score: number;
+  gold_bias: 'bullish' | 'bearish' | 'neutral';
+  gold_bias_score: number;
+  regime_label: string;
+  key_drivers: string[];
+  updated_at: string;
+}
+
+export interface VIPSignal {
+  pair: string;
+  direction: 'LONG' | 'SHORT';
+  entry_zone: string;
+  stop_loss: number;
+  tp1: number;
+  tp2: number;
+  tp3: number;
+  confidence: number;
+  confidence_label: 'HIGH' | 'MEDIUM' | 'LOW';
+  rationale: string;
+  regime_alignment: boolean;
+  time_frame: string;
+  r_r_ratio: number;
+  invalidation: string;
+  generated_at: string;
+  status: 'ACTIVE' | 'PENDING' | 'TRIGGERED';
+}
+
+export interface VIPCalendarEvent {
+  id: string;
+  datetime: string;
+  event: string;
+  country: string;
+  country_code: string;
+  currency: string;
+  impact: 'high' | 'medium' | 'low';
+  forecast: string;
+  previous: string;
+  actual: string | null;
+  surprise_index: number | null;
+  historical_gold_reaction: string;
+  historical_fx_reaction: Record<string, string>;
+  gold_impact_score: number;
+  pairs_affected: string[];
+}
+
+export interface BacktestResult {
+  strategy_name: string;
+  display_name: string;
+  description: string;
+  parameters: Record<string, unknown>;
+  period: string;
+  total_trades: number;
+  win_rate: number;
+  profit_factor: number;
+  sharpe_ratio: number;
+  max_drawdown: number;
+  net_pnl_pct: number;
+  avg_trade_pnl: number;
+  best_trade: number;
+  worst_trade: number;
+  avg_hold_bars: number;
+  equity_curve: Array<{ date: string; equity: number }>;
+  monthly_returns: Array<{ month: string; return: number }>;
+  trade_distribution: Array<{ bucket: string; count: number }>;
+  regime_breakdown: Array<{ regime: string; trades: number; win_rate: number; avg_pnl: number }>;
+  pair: string;
+  timeframe: string;
+}
+
+export interface ScenarioImpact {
+  direction: string;
+  expected_move_pct: number;
+  confidence: string;
+}
+
+export interface VIPScenario {
+  scenario_id: string;
+  name: string;
+  category: 'inflation' | 'policy' | 'risk' | 'geopolitical';
+  description: string;
+  probability: number;
+  impact: Record<string, ScenarioImpact>;
+  key_levels: Record<string, number>;
+  trading_playbook: string;
+  historical_analog: string;
+}
+
+export interface PortfolioRiskResult {
+  total_exposure_usd: number;
+  usd_exposure: number;
+  gold_exposure: number;
+  positions_summary: Array<Record<string, unknown>>;
+  correlation_matrix: Record<string, Record<string, number>>;
+  portfolio_var_95: number;
+  portfolio_var_99: number;
+  expected_drawdown: number;
+  concentration_risk: 'LOW' | 'MEDIUM' | 'HIGH';
+  position_sizes: Array<{ pair: string; recommended_lots: number; max_lots: number }>;
+  risk_warnings: string[];
+}
+
+// VIP mock data (used when backend unavailable)
+const MOCK_REGIME: VIPRegime = {
+  risk_sentiment: 'risk_off',
+  risk_score: 32,
+  inflation_regime: 'high_inflation',
+  inflation_score: 72,
+  usd_cycle: 'neutral',
+  usd_score: 51,
+  gold_bias: 'bullish',
+  gold_bias_score: 68,
+  regime_label: 'Risk-Off + High Inflation → Gold Strongly Bullish',
+  key_drivers: [
+    'VIX elevated at 18.4, signaling risk aversion',
+    'Core PCE sticky at 3.2%, above Fed target',
+    'USD softening on dovish Fed pivot expectations',
+    'Real yields falling — gold tailwind building',
+    'Central bank gold buying at record pace'
+  ],
+  updated_at: new Date().toISOString()
+};
+
+const MOCK_SIGNALS: VIPSignal[] = [
+  {
+    pair: 'XAU/USD', direction: 'LONG', entry_zone: '2618–2628', stop_loss: 2594, tp1: 2648, tp2: 2672, tp3: 2698,
+    confidence: 82, confidence_label: 'HIGH', regime_alignment: true, time_frame: 'H4', r_r_ratio: 2.3,
+    rationale: 'Gold retesting ascending trendline support within risk-off regime. Macro model shows high inflation + weak dollar alignment. Key support at 2618 confluence.',
+    invalidation: 'Break and 4H close below 2590', generated_at: new Date().toISOString(), status: 'ACTIVE'
+  },
+  {
+    pair: 'EUR/USD', direction: 'LONG', entry_zone: '1.0838–1.0852', stop_loss: 1.0812, tp1: 1.0878, tp2: 1.0914, tp3: 1.0958,
+    confidence: 65, confidence_label: 'MEDIUM', regime_alignment: true, time_frame: 'D1', r_r_ratio: 1.9,
+    rationale: 'ECB-Fed divergence narrowing as US data softens. Dollar weakness in risk-off regime supports EUR. Weekly demand zone intact.',
+    invalidation: 'Daily close below 1.0800', generated_at: new Date().toISOString(), status: 'ACTIVE'
+  },
+  {
+    pair: 'USD/JPY', direction: 'SHORT', entry_zone: '157.80–158.20', stop_loss: 159.10, tp1: 156.80, tp2: 155.60, tp3: 154.20,
+    confidence: 71, confidence_label: 'HIGH', regime_alignment: true, time_frame: 'H4', r_r_ratio: 2.1,
+    rationale: 'BoJ hawkish pivot risk building. Risk-off sentiment to strengthen JPY. Overbought on daily RSI with bearish divergence forming.',
+    invalidation: 'Break above 159.50 on 4H close', generated_at: new Date().toISOString(), status: 'ACTIVE'
+  },
+  {
+    pair: 'GBP/USD', direction: 'LONG', entry_zone: '1.2665–1.2685', stop_loss: 1.2630, tp1: 1.2720, tp2: 1.2775, tp3: 1.2840,
+    confidence: 58, confidence_label: 'MEDIUM', regime_alignment: false, time_frame: 'H4', r_r_ratio: 1.8,
+    rationale: 'Technical setup strong with higher lows structure intact. UK CPI surprise potential next week. Regime not fully aligned — size smaller.',
+    invalidation: 'Break below 1.2620', generated_at: new Date().toISOString(), status: 'PENDING'
+  },
+  {
+    pair: 'AUD/USD', direction: 'LONG', entry_zone: '0.6438–0.6455', stop_loss: 0.6408, tp1: 0.6490, tp2: 0.6530, tp3: 0.6580,
+    confidence: 55, confidence_label: 'MEDIUM', regime_alignment: false, time_frame: 'D1', r_r_ratio: 2.0,
+    rationale: 'Commodity currency supported by gold price strength. China stimulus narrative providing support. Risk-off headwind is the key contra.',
+    invalidation: 'Daily close below 0.6400', generated_at: new Date().toISOString(), status: 'PENDING'
+  },
+  {
+    pair: 'XAU/EUR', direction: 'LONG', entry_zone: '2412–2420', stop_loss: 2390, tp1: 2445, tp2: 2478, tp3: 2510,
+    confidence: 76, confidence_label: 'HIGH', regime_alignment: true, time_frame: 'D1', r_r_ratio: 2.5,
+    rationale: 'Gold outperforming EUR amid ECB rate cut cycle. Inflation-adjusted gold vs EUR showing breakout. Strong institutional demand.',
+    invalidation: 'Weekly close below 2388', generated_at: new Date().toISOString(), status: 'ACTIVE'
+  }
+];
+
+export async function fetchVIPRegime(): Promise<VIPRegime> {
+  try {
+    const res = await api.get<VIPRegime>('/api/vip/regime');
+    return res.data;
+  } catch { return MOCK_REGIME; }
+}
+
+export async function fetchVIPSignals(): Promise<VIPSignal[]> {
+  try {
+    const res = await api.get<VIPSignal[]>('/api/vip/signals');
+    return res.data;
+  } catch { return MOCK_SIGNALS; }
+}
+
+export async function fetchVIPCalendar(): Promise<VIPCalendarEvent[]> {
+  try {
+    const res = await api.get<VIPCalendarEvent[]>('/api/vip/calendar');
+    return res.data;
+  } catch { return []; }
+}
+
+export async function fetchBacktest(strategy: string): Promise<BacktestResult | null> {
+  try {
+    const res = await api.get<BacktestResult>(`/api/vip/backtest/${strategy}`);
+    return res.data;
+  } catch { return null; }
+}
+
+export async function fetchVIPScenarios(): Promise<VIPScenario[]> {
+  try {
+    const res = await api.get<VIPScenario[]>('/api/vip/scenarios');
+    return res.data;
+  } catch { return []; }
+}
+
+export async function submitPortfolioRisk(positions: Record<string, unknown>[]): Promise<PortfolioRiskResult | null> {
+  try {
+    const res = await api.post<PortfolioRiskResult>('/api/vip/risk', { positions });
+    return res.data;
+  } catch { return null; }
+}
+
 export default api;

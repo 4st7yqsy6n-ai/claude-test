@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 
-export type ActiveView = 'terminal' | 'macro' | 'screener' | 'news' | 'ai' | 'backtesting';
+export type ActiveView = 'terminal' | 'macro' | 'screener' | 'news' | 'ai' | 'backtesting' | 'vip';
 export type ThemeType = 'bloomberg' | 'dark' | 'matrix';
 
 interface UIState {
