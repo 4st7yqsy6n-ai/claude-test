@@ -13,6 +13,7 @@ from fastapi.staticfiles import StaticFiles
 
 from app.config import settings
 from app.routers import ai_router, macro, market, news, screener
+from app.routers import vip_router
 from app.services.market_service import MOCK_PRICES
 
 logging.basicConfig(
@@ -48,6 +49,7 @@ app.include_router(macro.router, prefix="/api")
 app.include_router(news.router, prefix="/api")
 app.include_router(ai_router.router, prefix="/api")
 app.include_router(screener.router, prefix="/api")
+app.include_router(vip_router.router, prefix="/api")
 
 # ---------------------------------------------------------------------------
 # Symbols streamed over WebSocket

@@ -1,4 +1,4 @@
-import { Monitor, Globe, Filter, Newspaper, Brain, BarChart2, ChevronLeft, ChevronRight } from 'lucide-react';
+import { Monitor, Globe, Filter, Newspaper, Brain, BarChart2, Crown, ChevronLeft, ChevronRight } from 'lucide-react';
 import { useUIStore, type ActiveView } from '@/stores/uiStore';
 import { useMarketStore } from '@/stores/marketStore';
 import clsx from 'clsx';
@@ -10,6 +10,7 @@ const NAV_ITEMS: { view: ActiveView; icon: React.ElementType; label: string; sho
   { view: 'news', icon: Newspaper, label: 'News', shortcut: 'F4' },
   { view: 'ai', icon: Brain, label: 'AI Analyst', shortcut: 'F5' },
   { view: 'backtesting', icon: BarChart2, label: 'Backtest', shortcut: 'F6' },
+  { view: 'vip', icon: Crown, label: 'VIP Edge', shortcut: 'F7' },
 ];
 
 function formatChange(pct: number): string {

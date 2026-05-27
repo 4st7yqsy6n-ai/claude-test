@@ -26,6 +26,9 @@ import EconomicCalendar from '@/components/Panels/EconomicCalendar';
 // AI
 import AIAnalyst from '@/components/AI/AIAnalyst';
 
+// VIP
+import VIPDashboard from '@/components/VIP/VIPDashboard';
+
 // Command Palette
 import CommandPalette from '@/components/CommandPalette/CommandPalette';
 
@@ -185,6 +188,7 @@ function AppContent() {
       if (e.key === 'F4') { e.preventDefault(); useUIStore.getState().setActiveView('news'); }
       if (e.key === 'F5') { e.preventDefault(); useUIStore.getState().setActiveView('ai'); }
       if (e.key === 'F6') { e.preventDefault(); useUIStore.getState().setActiveView('backtesting'); }
+      if (e.key === 'F7') { e.preventDefault(); useUIStore.getState().setActiveView('vip'); }
     };
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
@@ -198,6 +202,7 @@ function AppContent() {
       case 'news':        return <div className="h-full overflow-hidden"><NewsPanel /></div>;
       case 'ai':          return <div className="h-full overflow-hidden"><AIAnalyst /></div>;
       case 'backtesting': return <BacktestingView />;
+      case 'vip':         return <VIPDashboard />;
       default:            return <TerminalView />;
     }
   };
