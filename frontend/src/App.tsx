@@ -25,6 +25,7 @@ import EconomicCalendar from '@/components/Panels/EconomicCalendar';
 
 // AI
 import AIAnalyst from '@/components/AI/AIAnalyst';
+import JarvisPanel from '@/components/Jarvis/JarvisPanel';
 
 // Command Palette
 import CommandPalette from '@/components/CommandPalette/CommandPalette';
@@ -96,23 +97,26 @@ function TerminalView() {
 
 function MacroView() {
   return (
-    <div className="h-full overflow-auto">
-      {/* Macro Indicators */}
-      <MacroDashboard />
-
-      {/* Yield Curve + Correlation side by side */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-0 border-t border-[#1f1f1f]">
-        <div className="border-r border-[#1f1f1f] h-[380px]">
-          <YieldCurveChart />
+    <div className="flex h-full overflow-hidden">
+      {/* Main scrollable content */}
+      <div className="flex-1 overflow-auto">
+        <MacroDashboard />
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-0 border-t border-[#1f1f1f]">
+          <div className="border-r border-[#1f1f1f] h-[380px]">
+            <YieldCurveChart />
+          </div>
+          <div className="h-[380px]">
+            <CorrelationMatrix />
+          </div>
         </div>
-        <div className="h-[380px]">
-          <CorrelationMatrix />
+        <div className="border-t border-[#1f1f1f]">
+          <WorldMonitor />
         </div>
       </div>
 
-      {/* World Monitor */}
-      <div className="border-t border-[#1f1f1f]">
-        <WorldMonitor />
+      {/* Right panel: Jarvis */}
+      <div className="w-[340px] shrink-0 border-l border-[#1f1f1f] flex flex-col overflow-hidden">
+        <JarvisPanel />
       </div>
     </div>
   );

@@ -238,4 +238,62 @@ export async function getEconomicCalendar(): Promise<EconomicEvent[]> {
   }
 }
 
+export interface WorldIndex {
+  symbol: string;
+  name: string;
+  country: string;
+  flag: string;
+  region: 'americas' | 'europe' | 'asia-pacific';
+  price: number;
+  change: number;
+  change_pct: number;
+}
+
+export interface WorldIndicesResponse {
+  indices: {
+    americas: WorldIndex[];
+    europe: WorldIndex[];
+    'asia-pacific': WorldIndex[];
+  };
+  source: 'koyfin' | 'yfinance' | 'mock';
+  timestamp: string;
+}
+
+const MOCK_WORLD_INDICES: WorldIndicesResponse = {
+  indices: {
+    americas: [
+      { symbol: 'SPX',  name: 'S&P 500',       country: 'United States', flag: '🇺🇸', region: 'americas',      price: 5847.23,   change: 24.56,   change_pct: 0.42  },
+      { symbol: 'NDX',  name: 'Nasdaq 100',     country: 'United States', flag: '🇺🇸', region: 'americas',      price: 20412.18,  change: 142.33,  change_pct: 0.70  },
+      { symbol: 'TSX',  name: 'TSX Composite',  country: 'Canada',        flag: '🇨🇦', region: 'americas',      price: 22847.40,  change: 88.12,   change_pct: 0.39  },
+      { symbol: 'IBOV', name: 'Bovespa',        country: 'Brazil',        flag: '🇧🇷', region: 'americas',      price: 131244.80, change: -842.30, change_pct: -0.64 },
+      { symbol: 'MXX',  name: 'IPC Mexico',     country: 'Mexico',        flag: '🇲🇽', region: 'americas',      price: 52438.20,  change: 124.80,  change_pct: 0.24  },
+    ],
+    europe: [
+      { symbol: 'DAX',  name: 'DAX 40',         country: 'Germany',        flag: '🇩🇪', region: 'europe',        price: 19248.50,  change: 184.20,  change_pct: 0.97  },
+      { symbol: 'FTSE', name: 'FTSE 100',        country: 'United Kingdom', flag: '🇬🇧', region: 'europe',        price: 8284.40,   change: -42.30,  change_pct: -0.51 },
+      { symbol: 'CAC',  name: 'CAC 40',          country: 'France',         flag: '🇫🇷', region: 'europe',        price: 7602.80,   change: 38.40,   change_pct: 0.51  },
+      { symbol: 'IBEX', name: 'IBEX 35',         country: 'Spain',          flag: '🇪🇸', region: 'europe',        price: 11482.60,  change: 94.10,   change_pct: 0.83  },
+      { symbol: 'SMI',  name: 'SMI Index',       country: 'Switzerland',    flag: '🇨🇭', region: 'europe',        price: 11924.80,  change: -28.40,  change_pct: -0.24 },
+    ],
+    'asia-pacific': [
+      { symbol: 'N225',   name: 'Nikkei 225',    country: 'Japan',        flag: '🇯🇵', region: 'asia-pacific',  price: 38620.40,  change: 482.80,  change_pct: 1.27  },
+      { symbol: 'HSI',    name: 'Hang Seng',     country: 'Hong Kong',    flag: '🇭🇰', region: 'asia-pacific',  price: 19281.50,  change: -148.20, change_pct: -0.76 },
+      { symbol: 'SHCOMP', name: 'Shanghai Comp.',country: 'China',        flag: '🇨🇳', region: 'asia-pacific',  price: 3302.48,   change: 24.82,   change_pct: 0.76  },
+      { symbol: 'ASX',    name: 'ASX 200',       country: 'Australia',    flag: '🇦🇺', region: 'asia-pacific',  price: 8284.40,   change: 48.20,   change_pct: 0.58  },
+      { symbol: 'KOSPI',  name: 'KOSPI',         country: 'South Korea',  flag: '🇰🇷', region: 'asia-pacific',  price: 2574.82,   change: -18.42,  change_pct: -0.71 },
+    ],
+  },
+  source: 'mock',
+  timestamp: new Date().toISOString(),
+};
+
+export async function fetchWorldIndices(): Promise<WorldIndicesResponse> {
+  try {
+    const response = await api.get<WorldIndicesResponse>('/api/market/world');
+    return response.data;
+  } catch {
+    return MOCK_WORLD_INDICES;
+  }
+}
+
 export default api;

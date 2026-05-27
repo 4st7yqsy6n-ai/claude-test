@@ -10,9 +10,20 @@ from app.services.market_service import (
     get_ohlcv,
     get_ticker_info,
 )
+from app.services.koyfin_service import get_world_indices
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/market", tags=["market"])
+
+
+@router.get("/world")
+def world_indices():
+    """Return global equity indices by region (Koyfin → yfinance → mock fallback)."""
+    try:
+        return get_world_indices()
+    except Exception as exc:
+        logger.error("world indices error: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 @router.get("/overview")
