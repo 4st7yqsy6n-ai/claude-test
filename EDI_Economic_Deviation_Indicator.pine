@@ -1,0 +1,634 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0
+// © EDI v1.0 — Economic Deviation Indicator
+//@version=5
+
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║   ECONOMIC DEVIATION INDICATOR (EDI)  v1.0                              ║
+// ║                                                                           ║
+// ║   A multi-factor quantitative forex matrix combining:                    ║
+// ║   • 28-pair Currency Strength Index  (CSI)  — RSI-derived               ║
+// ║   • Statistical Z-Score Deviation from rolling mean                      ║
+// ║   • CFTC COT Net Speculator positioning  (real or price-proxy)           ║
+// ║   • Δ Flow — 5-bar acceleration of currency strength                    ║
+// ║   • Momentum  (fast EMA – slow EMA)                                     ║
+// ║   • Persistence  (consecutive directional bars)                          ║
+// ║   • Weighted Composite Score → ranked signal per currency                ║
+// ║   • Pair EDI Spread for current chart symbol                             ║
+// ║                                                                           ║
+// ║   Institutional data sources (publicly available):                        ║
+// ║   • CFTC COT via TradingView  (CFTC:XXXXXX_FO_ALL tickers)              ║
+// ║   • Proxy mode: LT-RSI minus ST-RSI divergence on currency strength      ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
+
+indicator("EDI – Economic Deviation Indicator", shorttitle="EDI",
+          overlay=false, max_lines_count=500, max_labels_count=200,
+          max_boxes_count=50)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// INPUTS
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+G_CS   = "▶ CURRENCY STRENGTH INDEX"
+G_DEV  = "▶ STATISTICAL DEVIATION (Z-SCORE)"
+G_COT  = "▶ COT INSTITUTIONAL DATA"
+G_MOM  = "▶ MOMENTUM & PERSISTENCE"
+G_SIG  = "▶ COMPOSITE & SIGNAL"
+G_DISP = "▶ DISPLAY"
+
+// ── Currency Strength
+cs_rsi_len  = input.int   (14,   "RSI Length",                minval=2, maxval=50,    group=G_CS)
+cs_smooth   = input.int   (5,    "Smoothing (EMA bars)",      minval=1, maxval=30,    group=G_CS)
+
+// ── Deviation
+dev_len     = input.int   (100,  "Z-Score Lookback (bars)",   minval=20, maxval=500,  group=G_DEV)
+dev_thresh  = input.float (1.5,  "Extreme Alert Threshold σ", minval=0.5, maxval=3.0,
+                           step=0.1,                                                    group=G_DEV)
+
+// ── COT
+use_cot     = input.bool  (true, "Include COT/Institutional", group=G_COT)
+cot_src     = input.string("Proxy (Price-Based)", "Data Source",
+              options=["Real CFTC (TradingView)", "Proxy (Price-Based)"],               group=G_COT,
+              tooltip="Real CFTC: requires the CFTC COT data feed in TradingView.\n" +
+                      "Proxy: uses LT vs ST RSI divergence as institutional sentiment proxy.")
+cot_weight  = input.float (0.25, "COT Weight in Score",        minval=0.0, maxval=0.5, step=0.05, group=G_COT)
+cot_norm_p  = input.int   (52,   "COT Normalise Period (wks)", minval=4, maxval=156,   group=G_COT)
+
+// ── Momentum
+mom_fast    = input.int   (5,    "Fast EMA",              minval=1, maxval=30,         group=G_MOM)
+mom_slow    = input.int   (20,   "Slow EMA",              minval=3, maxval=200,        group=G_MOM)
+pers_len    = input.int   (10,   "Persistence Window",    minval=2, maxval=30,         group=G_MOM)
+dflow_bars  = input.int   (5,    "Δ Flow Lookback",       minval=1, maxval=20,         group=G_MOM)
+
+// ── Composite weights (the remaining weight after COT is split below)
+w_str_pct   = input.float (45,   "Strength weight %",    minval=10, maxval=80,        group=G_SIG)
+w_dev_pct   = input.float (30,   "Deviation weight %",   minval=5, maxval=60,         group=G_SIG)
+w_mom_pct   = input.float (15,   "Momentum weight %",    minval=0, maxval=40,         group=G_SIG)
+// Persistence gets the remainder
+
+// ── Display
+tbl_pos_str = input.string("top_right", "Table Position",
+              options=["top_right","top_left","bottom_right","bottom_left",
+                       "middle_right","middle_left"],                                    group=G_DISP)
+show_matrix = input.bool  (true,  "Show EDI Matrix",                                   group=G_DISP)
+show_spread = input.bool  (true,  "Show Pair Spread Chart",                             group=G_DISP)
+show_zones  = input.bool  (true,  "Colour Extreme Zones",                               group=G_DISP)
+col_bull    = input.color (color.new(#26a69a, 0), "Bullish",                           group=G_DISP)
+col_bear    = input.color (color.new(#ef5350, 0), "Bearish",                           group=G_DISP)
+col_neut    = input.color (color.new(#546e7a, 0), "Neutral",                           group=G_DISP)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// UTILITY FUNCTIONS
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// Z-Score: standard deviations from rolling mean
+f_z(src, len) =>
+    avg = ta.sma(src, len)
+    sd  = ta.stdev(src, len)
+    sd > 0.0 ? (src - avg) / sd : 0.0
+
+// Normalise to [0, 100]
+f_norm(src, len) =>
+    lo  = ta.lowest(src, len)
+    hi  = ta.highest(src, len)
+    rng = hi - lo
+    rng > 0.0 ? (src - lo) / rng * 100.0 : 50.0
+
+// Hard clamp
+f_clamp(v, lo, hi) => math.max(lo, math.min(hi, v))
+
+// RSI for an external symbol (no lookahead bias)
+f_rsi(sym) =>
+    c = request.security(sym, timeframe.period, close, lookahead=barmerge.lookahead_off,
+                         gaps=barmerge.gaps_off)
+    ta.rsi(c, cs_rsi_len)
+
+// Persistence: signed count of consecutive same-direction bars in [src]
+f_persist(src) =>
+    dir = src > src[1] ? 1 : src < src[1] ? -1 : 0
+    cnt = 0
+    if dir != 0
+        for i = 0 to pers_len - 1
+            d_i = src[i] > src[i + 1] ? 1 : src[i] < src[i + 1] ? -1 : 0
+            if d_i == dir
+                cnt += 1
+            else
+                break
+    dir != 0 ? cnt * dir : 0
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// STEP 1 — FETCH RSI FOR ALL 28 MAJOR PAIRS  (28 security calls)
+// Rule: BASE currency going up in a pair ↔ base is strengthening.
+//   Base RSI  → contributes to base strength positively
+//   Quote RSI → contributes to quote weakness; base gets (100 − RSI)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// USD Majors
+r_EURUSD = f_rsi("FX:EURUSD")
+r_GBPUSD = f_rsi("FX:GBPUSD")
+r_AUDUSD = f_rsi("FX:AUDUSD")
+r_NZDUSD = f_rsi("FX:NZDUSD")
+r_USDCAD = f_rsi("FX:USDCAD")
+r_USDCHF = f_rsi("FX:USDCHF")
+r_USDJPY = f_rsi("FX:USDJPY")
+
+// EUR Crosses
+r_EURGBP = f_rsi("FX:EURGBP")
+r_EURAUD = f_rsi("FX:EURAUD")
+r_EURNZD = f_rsi("FX:EURNZD")
+r_EURCAD = f_rsi("FX:EURCAD")
+r_EURCHF = f_rsi("FX:EURCHF")
+r_EURJPY = f_rsi("FX:EURJPY")
+
+// GBP Crosses
+r_GBPAUD = f_rsi("FX:GBPAUD")
+r_GBPNZD = f_rsi("FX:GBPNZD")
+r_GBPCAD = f_rsi("FX:GBPCAD")
+r_GBPCHF = f_rsi("FX:GBPCHF")
+r_GBPJPY = f_rsi("FX:GBPJPY")
+
+// AUD Crosses
+r_AUDNZD = f_rsi("FX:AUDNZD")
+r_AUDCAD = f_rsi("FX:AUDCAD")
+r_AUDCHF = f_rsi("FX:AUDCHF")
+r_AUDJPY = f_rsi("FX:AUDJPY")
+
+// NZD Crosses
+r_NZDCAD = f_rsi("FX:NZDCAD")
+r_NZDCHF = f_rsi("FX:NZDCHF")
+r_NZDJPY = f_rsi("FX:NZDJPY")
+
+// CAD Crosses
+r_CADCHF = f_rsi("FX:CADCHF")
+r_CADJPY = f_rsi("FX:CADJPY")
+
+// CHF/JPY
+r_CHFJPY = f_rsi("FX:CHFJPY")
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// STEP 2 — CURRENCY STRENGTH INDEX (CSI)
+// Each currency averages 7 pair-RSI contributions → [0, 100]
+// Midpoint 50 = neutral; > 50 = strong; < 50 = weak
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+csi_USD_r = (((100 - r_EURUSD) + (100 - r_GBPUSD) + (100 - r_AUDUSD) + (100 - r_NZDUSD) +
+               r_USDCAD + r_USDCHF + r_USDJPY)) / 7
+
+csi_EUR_r = (r_EURUSD + r_EURGBP + r_EURAUD + r_EURNZD +
+             r_EURCAD + r_EURCHF + r_EURJPY) / 7
+
+csi_GBP_r = (r_GBPUSD + (100 - r_EURGBP) + r_GBPAUD + r_GBPNZD +
+             r_GBPCAD + r_GBPCHF + r_GBPJPY) / 7
+
+csi_AUD_r = (r_AUDUSD + (100 - r_EURAUD) + (100 - r_GBPAUD) + r_AUDNZD +
+             r_AUDCAD + r_AUDCHF + r_AUDJPY) / 7
+
+csi_NZD_r = (r_NZDUSD + (100 - r_EURNZD) + (100 - r_GBPNZD) + (100 - r_AUDNZD) +
+             r_NZDCAD + r_NZDCHF + r_NZDJPY) / 7
+
+csi_CAD_r = ((100 - r_USDCAD) + (100 - r_EURCAD) + (100 - r_GBPCAD) + (100 - r_AUDCAD) +
+             (100 - r_NZDCAD) + r_CADCHF + r_CADJPY) / 7
+
+csi_CHF_r = ((100 - r_USDCHF) + (100 - r_EURCHF) + (100 - r_GBPCHF) + (100 - r_AUDCHF) +
+             (100 - r_NZDCHF) + (100 - r_CADCHF) + r_CHFJPY) / 7
+
+csi_JPY_r = ((100 - r_USDJPY) + (100 - r_EURJPY) + (100 - r_GBPJPY) + (100 - r_AUDJPY) +
+             (100 - r_NZDJPY) + (100 - r_CADJPY) + (100 - r_CHFJPY)) / 7
+
+// Apply EMA smoothing
+csi_USD = ta.ema(csi_USD_r, cs_smooth)
+csi_EUR = ta.ema(csi_EUR_r, cs_smooth)
+csi_GBP = ta.ema(csi_GBP_r, cs_smooth)
+csi_AUD = ta.ema(csi_AUD_r, cs_smooth)
+csi_NZD = ta.ema(csi_NZD_r, cs_smooth)
+csi_CAD = ta.ema(csi_CAD_r, cs_smooth)
+csi_CHF = ta.ema(csi_CHF_r, cs_smooth)
+csi_JPY = ta.ema(csi_JPY_r, cs_smooth)
+
+// Net % from neutral (positive = strong, negative = weak)
+net_USD = csi_USD - 50.0
+net_EUR = csi_EUR - 50.0
+net_GBP = csi_GBP - 50.0
+net_AUD = csi_AUD - 50.0
+net_NZD = csi_NZD - 50.0
+net_CAD = csi_CAD - 50.0
+net_CHF = csi_CHF - 50.0
+net_JPY = csi_JPY - 50.0
+
+// Δ Flow: acceleration of strength over dflow_bars bars
+df_USD = csi_USD - csi_USD[dflow_bars]
+df_EUR = csi_EUR - csi_EUR[dflow_bars]
+df_GBP = csi_GBP - csi_GBP[dflow_bars]
+df_AUD = csi_AUD - csi_AUD[dflow_bars]
+df_NZD = csi_NZD - csi_NZD[dflow_bars]
+df_CAD = csi_CAD - csi_CAD[dflow_bars]
+df_CHF = csi_CHF - csi_CHF[dflow_bars]
+df_JPY = csi_JPY - csi_JPY[dflow_bars]
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// STEP 3 — STATISTICAL DEVIATION (Z-SCORE)
+// How many σ is the current CSI from its historical mean?
+//   > +1.5σ → historically overbought / extreme strength
+//   < −1.5σ → historically oversold / extreme weakness
+//   Useful for mean-reversion and momentum confirmation setups
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+dev_USD = f_z(csi_USD, dev_len)
+dev_EUR = f_z(csi_EUR, dev_len)
+dev_GBP = f_z(csi_GBP, dev_len)
+dev_AUD = f_z(csi_AUD, dev_len)
+dev_NZD = f_z(csi_NZD, dev_len)
+dev_CAD = f_z(csi_CAD, dev_len)
+dev_CHF = f_z(csi_CHF, dev_len)
+dev_JPY = f_z(csi_JPY, dev_len)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// STEP 4 — COT INSTITUTIONAL POSITIONING  (8 security calls)
+//
+// Source A — Real CFTC data (requires TradingView COT data access):
+//   CFTC:XXXXXX_FO_ALL → weekly Futures-Only report
+//   'close' = Net Non-Commercial (large speculator) positions
+//   Codes:  EUR 099741 | GBP 096742 | JPY 097741 | CHF 092741
+//           CAD 090741 | AUD 232741 | NZD 112741 | DXY 098662
+//
+// Source B — Price-Based Proxy (no extra data needed):
+//   Divergence between 50-bar and 10-bar RSI of the CSI.
+//   Captures the split between long-horizon (institutional) and
+//   short-horizon (retail) momentum — a well-known quant proxy.
+//
+// Both are normalised to [−50, +50] for compositing.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// ── A: Real CFTC  (weekly, net non-commercial = speculator longs − shorts)
+cot_EUR_raw = request.security("CFTC:099741_FO_ALL", "W", close, lookahead=barmerge.lookahead_off, gaps=barmerge.gaps_off)
+cot_GBP_raw = request.security("CFTC:096742_FO_ALL", "W", close, lookahead=barmerge.lookahead_off, gaps=barmerge.gaps_off)
+cot_JPY_raw = request.security("CFTC:097741_FO_ALL", "W", close, lookahead=barmerge.lookahead_off, gaps=barmerge.gaps_off)
+cot_CHF_raw = request.security("CFTC:092741_FO_ALL", "W", close, lookahead=barmerge.lookahead_off, gaps=barmerge.gaps_off)
+cot_CAD_raw = request.security("CFTC:090741_FO_ALL", "W", close, lookahead=barmerge.lookahead_off, gaps=barmerge.gaps_off)
+cot_AUD_raw = request.security("CFTC:232741_FO_ALL", "W", close, lookahead=barmerge.lookahead_off, gaps=barmerge.gaps_off)
+cot_NZD_raw = request.security("CFTC:112741_FO_ALL", "W", close, lookahead=barmerge.lookahead_off, gaps=barmerge.gaps_off)
+cot_USD_raw = request.security("CFTC:098662_FO_ALL", "W", close, lookahead=barmerge.lookahead_off, gaps=barmerge.gaps_off)
+
+// Normalise each COT series to [0,100] over rolling window then shift to [−50,+50]
+// JPY futures are quoted as JPY/USD so the net is inverted versus USD/JPY chart
+cot_n_USD =  (f_norm(cot_USD_raw, cot_norm_p) - 50.0)
+cot_n_EUR =  (f_norm(cot_EUR_raw, cot_norm_p) - 50.0)
+cot_n_GBP =  (f_norm(cot_GBP_raw, cot_norm_p) - 50.0)
+cot_n_AUD =  (f_norm(cot_AUD_raw, cot_norm_p) - 50.0)
+cot_n_NZD =  (f_norm(cot_NZD_raw, cot_norm_p) - 50.0)
+cot_n_CAD =  (f_norm(cot_CAD_raw, cot_norm_p) - 50.0)
+cot_n_CHF =  (f_norm(cot_CHF_raw, cot_norm_p) - 50.0)
+cot_n_JPY = -(f_norm(cot_JPY_raw, cot_norm_p) - 50.0)   // inverted
+
+// ── B: Price-Based Proxy  (no extra security calls)
+// Long-term institutional RSI minus short-term retail RSI on CSI
+prx_USD = ta.rsi(csi_USD, 50) - ta.rsi(csi_USD, 10)
+prx_EUR = ta.rsi(csi_EUR, 50) - ta.rsi(csi_EUR, 10)
+prx_GBP = ta.rsi(csi_GBP, 50) - ta.rsi(csi_GBP, 10)
+prx_AUD = ta.rsi(csi_AUD, 50) - ta.rsi(csi_AUD, 10)
+prx_NZD = ta.rsi(csi_NZD, 50) - ta.rsi(csi_NZD, 10)
+prx_CAD = ta.rsi(csi_CAD, 50) - ta.rsi(csi_CAD, 10)
+prx_CHF = ta.rsi(csi_CHF, 50) - ta.rsi(csi_CHF, 10)
+prx_JPY = ta.rsi(csi_JPY, 50) - ta.rsi(csi_JPY, 10)
+
+// ── Select source
+use_real = (cot_src == "Real CFTC (TradingView)") and use_cot
+
+cot_USD = use_real ? cot_n_USD : prx_USD
+cot_EUR = use_real ? cot_n_EUR : prx_EUR
+cot_GBP = use_real ? cot_n_GBP : prx_GBP
+cot_AUD = use_real ? cot_n_AUD : prx_AUD
+cot_NZD = use_real ? cot_n_NZD : prx_NZD
+cot_CAD = use_real ? cot_n_CAD : prx_CAD
+cot_CHF = use_real ? cot_n_CHF : prx_CHF
+cot_JPY = use_real ? cot_n_JPY : prx_JPY
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// STEP 5 — MOMENTUM & PERSISTENCE
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+mom_USD = ta.ema(csi_USD, mom_fast) - ta.ema(csi_USD, mom_slow)
+mom_EUR = ta.ema(csi_EUR, mom_fast) - ta.ema(csi_EUR, mom_slow)
+mom_GBP = ta.ema(csi_GBP, mom_fast) - ta.ema(csi_GBP, mom_slow)
+mom_AUD = ta.ema(csi_AUD, mom_fast) - ta.ema(csi_AUD, mom_slow)
+mom_NZD = ta.ema(csi_NZD, mom_fast) - ta.ema(csi_NZD, mom_slow)
+mom_CAD = ta.ema(csi_CAD, mom_fast) - ta.ema(csi_CAD, mom_slow)
+mom_CHF = ta.ema(csi_CHF, mom_fast) - ta.ema(csi_CHF, mom_slow)
+mom_JPY = ta.ema(csi_JPY, mom_fast) - ta.ema(csi_JPY, mom_slow)
+
+pers_USD = f_persist(csi_USD)
+pers_EUR = f_persist(csi_EUR)
+pers_GBP = f_persist(csi_GBP)
+pers_AUD = f_persist(csi_AUD)
+pers_NZD = f_persist(csi_NZD)
+pers_CAD = f_persist(csi_CAD)
+pers_CHF = f_persist(csi_CHF)
+pers_JPY = f_persist(csi_JPY)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// STEP 6 — COMPOSITE SCORE  (range −1 to +1)
+// Weighted sum of normalised components.
+// All components are scaled to [−1, +1] before weighting so they
+// contribute proportionally regardless of their raw units.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// Normalise each component to [−1, +1]
+n_str (v)  => f_clamp((v - 50.0) / 50.0,  -1.0, 1.0)
+n_dev (v)  => f_clamp(v / 3.0,             -1.0, 1.0)
+n_cot (v)  => f_clamp(v / 50.0,            -1.0, 1.0)
+n_mom (v)  => f_clamp(v / 10.0,            -1.0, 1.0)
+n_pers(v)  => f_clamp(float(v) / float(pers_len), -1.0, 1.0)
+
+// Dynamic weight allocation — normalise user percentages, deduct COT share
+pct_total  = w_str_pct + w_dev_pct + w_mom_pct
+w_str      = (w_str_pct  / pct_total) * (1.0 - cot_weight)
+w_dev      = (w_dev_pct  / pct_total) * (1.0 - cot_weight)
+w_mom      = (w_mom_pct  / pct_total) * (1.0 - cot_weight)
+w_pers     = (1.0 - (w_str + w_dev + w_mom + (use_cot ? cot_weight : 0.0)))
+w_cot_eff  = use_cot ? cot_weight : 0.0
+
+f_composite(csi, dev, cot_v, mom_v, pers_v) =>
+    s = n_str(csi)   * w_str
+    d = n_dev(dev)   * w_dev
+    c = n_cot(cot_v) * w_cot_eff
+    m = n_mom(mom_v) * w_mom
+    p = n_pers(pers_v) * w_pers
+    f_clamp(s + d + c + m + p, -1.0, 1.0)
+
+comp_USD = f_composite(csi_USD, dev_USD, cot_USD, mom_USD, pers_USD)
+comp_EUR = f_composite(csi_EUR, dev_EUR, cot_EUR, mom_EUR, pers_EUR)
+comp_GBP = f_composite(csi_GBP, dev_GBP, cot_GBP, mom_GBP, pers_GBP)
+comp_AUD = f_composite(csi_AUD, dev_AUD, cot_AUD, mom_AUD, pers_AUD)
+comp_NZD = f_composite(csi_NZD, dev_NZD, cot_NZD, mom_NZD, pers_NZD)
+comp_CAD = f_composite(csi_CAD, dev_CAD, cot_CAD, mom_CAD, pers_CAD)
+comp_CHF = f_composite(csi_CHF, dev_CHF, cot_CHF, mom_CHF, pers_CHF)
+comp_JPY = f_composite(csi_JPY, dev_JPY, cot_JPY, mom_JPY, pers_JPY)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// STEP 7 — PAIR SPREAD FOR CURRENT CHART SYMBOL
+// Parse base/quote from syminfo.ticker (first 3 / last 3 chars)
+// EDI Spread = BASE composite − QUOTE composite
+// Positive → fundamental bias LONG the pair; Negative → bias SHORT
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+f_ccy_comp(ccy) =>
+    ccy == "EUR" ? comp_EUR :
+     ccy == "GBP" ? comp_GBP :
+     ccy == "AUD" ? comp_AUD :
+     ccy == "NZD" ? comp_NZD :
+     ccy == "CAD" ? comp_CAD :
+     ccy == "CHF" ? comp_CHF :
+     ccy == "JPY" ? comp_JPY : comp_USD   // USD and fallback
+
+sym_upper  = str.upper(syminfo.ticker)
+sym_len    = str.length(sym_upper)
+base3      = str.substring(sym_upper, 0, 3)
+quote3     = str.substring(sym_upper, sym_len - 3, sym_len)
+
+base_comp  = f_ccy_comp(base3)
+quote_comp = f_ccy_comp(quote3)
+edi_spread = base_comp - quote_comp      // [−2, +2]
+
+// Derived pair-level metrics
+expand_dir = edi_spread > edi_spread[3] ? "EXPANDING" : edi_spread < edi_spread[3] ? "FADING" : "FLAT"
+htf_align  = edi_spread > 0.1 ? "BULL ALIGN" : edi_spread < -0.1 ? "BEAR ALIGN" : "MIXED"
+pair_state = edi_spread >  0.5 ? "STRONG BULL" :
+             edi_spread >  0.2 ? "BULL" :
+             edi_spread < -0.5 ? "STRONG BEAR" :
+             edi_spread < -0.2 ? "BEAR" : "NEUTRAL"
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// CHART PLOTS
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+spread_scaled = edi_spread * 100.0   // scale to −200…+200 for readability
+sp_col = edi_spread > 0.0 ? col_bull : col_bear
+
+plot(show_spread ? spread_scaled : na, "EDI Spread",
+     color=sp_col, linewidth=2, style=plot.style_line)
+plot(show_spread ? spread_scaled : na, "EDI Histogram",
+     color=color.new(sp_col, 60), style=plot.style_histogram, linewidth=4)
+
+hline(0,     "Zero",         color=col_neut,                    linestyle=hline.style_dashed)
+hline( 50,   "Bull Bias",    color=color.new(col_bull, 60),     linestyle=hline.style_dotted)
+hline(-50,   "Bear Bias",    color=color.new(col_bear, 60),     linestyle=hline.style_dotted)
+hline( 100,  "Strong Bull",  color=color.new(col_bull, 30),     linestyle=hline.style_dotted)
+hline(-100,  "Strong Bear",  color=color.new(col_bear, 30),     linestyle=hline.style_dotted)
+
+any_extreme = math.abs(dev_USD) > dev_thresh or math.abs(dev_EUR) > dev_thresh or
+              math.abs(dev_GBP) > dev_thresh or math.abs(dev_AUD) > dev_thresh or
+              math.abs(dev_NZD) > dev_thresh or math.abs(dev_CAD) > dev_thresh or
+              math.abs(dev_CHF) > dev_thresh or math.abs(dev_JPY) > dev_thresh
+
+bgcolor(show_zones and any_extreme     ? color.new(color.yellow, 94) : na, title="Extreme Deviation Alert")
+bgcolor(show_zones and edi_spread >  0.5 ? color.new(col_bull, 91)  :
+        show_zones and edi_spread < -0.5 ? color.new(col_bear, 91)  : na, title="Zone BG")
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// EDI MATRIX TABLE
+// Layout: 10 columns × 14 rows
+//   Row 0 : main title (merged)
+//   Row 1 : current pair info bar (merged)
+//   Row 2 : column headers
+//   Rows 3–10 : one row per currency (8 currencies)
+//   Row 11: pair signal panel (merged, 5 cols)  + top-3 opportunities
+//   Row 12: divider / info (merged)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// ── Colour helpers
+f_score_bg(v) =>
+    v >  0.55 ? color.new(#1b5e20, 0) :
+    v >  0.25 ? color.new(#388e3c, 0) :
+    v >  0.05 ? color.new(#4caf50, 40) :
+    v < -0.55 ? color.new(#b71c1c, 0) :
+    v < -0.25 ? color.new(#c62828, 0) :
+    v < -0.05 ? color.new(#ef5350, 40) :
+               color.new(#37474f, 0)
+
+f_flow_bg(v) =>
+    v >  1.5 ? color.new(#1b5e20, 20) :
+    v >  0.3 ? color.new(#388e3c, 40) :
+    v < -1.5 ? color.new(#b71c1c, 20) :
+    v < -0.3 ? color.new(#c62828, 40) :
+               color.new(#263238, 0)
+
+f_dev_bg(v, thresh) =>
+    av = math.abs(v)
+    av > thresh * 1.5 ? (v > 0 ? color.new(#1b5e20, 5) : color.new(#b71c1c, 5)) :
+    av > thresh       ? (v > 0 ? color.new(#388e3c, 20) : color.new(#c62828, 20)) :
+                        color.new(#263238, 0)
+
+// ── Text helpers
+f_state(v) =>
+    v >  0.55 ? "VERY BULL" :
+    v >  0.25 ? "BULL"      :
+    v < -0.55 ? "VERY BEAR" :
+    v < -0.25 ? "BEAR"      : "NEUTRAL"
+
+f_signal(v) =>
+    v >  0.2 ? "▲ LONG"  :
+    v < -0.2 ? "▼ SHORT" : "◆ WAIT"
+
+f_dev_label(v, thresh) =>
+    math.abs(v) > thresh * 1.5 ? (v > 0 ? "⚡XTREME+" : "⚡XTREME-") :
+    math.abs(v) > thresh        ? (v > 0 ? "HIGH+"     : "HIGH-")     :
+    v > 0.4 ? "ABOVE" : v < -0.4 ? "BELOW" : "MEAN"
+
+f_cot_label(v, is_real) =>
+    is_real ?
+     (v >  20 ? "▲▲ HEAVY" : v > 5 ? "▲ LONG" : v < -20 ? "▼▼ HEAVY" : v < -5 ? "▼ SHORT" : "= NEUTRAL") :
+     (v >  10 ? "▲ INST+"  : v > 3 ? "▲ BIAS+" : v < -10 ? "▼ INST-" : v < -3 ? "▼ BIAS-" : "= NEUTRAL")
+
+f_n2(v) => str.tostring(math.round(v * 100.0) / 100.0, "#.##")
+f_n1(v) => str.tostring(math.round(v * 10.0)  / 10.0,  "#.#")
+
+// ── Table position
+tbl_position =
+ tbl_pos_str == "top_right"    ? position.top_right    :
+ tbl_pos_str == "top_left"     ? position.top_left     :
+ tbl_pos_str == "bottom_right" ? position.bottom_right :
+ tbl_pos_str == "bottom_left"  ? position.bottom_left  :
+ tbl_pos_str == "middle_right" ? position.middle_right : position.middle_left
+
+// ── Static colours
+C_BG0  = color.new(#0d1117, 0)    // deep navy
+C_BG1  = color.new(#161b22, 0)    // header
+C_BG2  = color.new(#1c2333, 0)    // subheader
+C_ROW0 = color.new(#1e2530, 0)
+C_ROW1 = color.new(#252d3d, 0)
+C_TXT  = color.new(#e6edf3, 0)
+C_GOLD = color.new(#e3b341, 0)
+C_SILVER = color.new(#8b949e, 0)
+
+// ── Build table once, update cells on last bar
+var table T = table.new(tbl_position, 10, 14,
+     border_color=color.new(#30363d, 0), border_width=1,
+     frame_color =color.new(#58a6ff, 0), frame_width=1)
+
+if show_matrix and barstate.islast
+
+    // ── Row 0: Main title
+    table.cell(T, 0, 0, "⚡ ECONOMIC DEVIATION INDICATOR  (EDI)  v1.0",
+               bgcolor=C_BG0, text_color=C_GOLD, text_size=size.small,
+               text_halign=text.align_center)
+    table.merge_cells(T, 0, 0, 9, 0)
+
+    // ── Row 1: Current pair info
+    cot_tag   = use_cot ? (use_real ? "[COT:LIVE]" : "[COT:PROXY]") : "[COT:OFF]"
+    pair_info = sym_upper + "  BASE:" + f_n2(base_comp) + "  QUOTE:" + f_n2(quote_comp) +
+                "  SPREAD:" + f_n2(edi_spread) + "  " + pair_state + "  EXPAND:" +
+                expand_dir + "  HTF:" + htf_align + "  " + cot_tag
+    table.cell(T, 0, 1, pair_info, bgcolor=C_BG2, text_color=C_SILVER,
+               text_size=size.tiny, text_halign=text.align_center)
+    table.merge_cells(T, 0, 1, 9, 1)
+
+    // ── Row 2: Column headers
+    hdrs = array.from("CCY", "CSI", "NET %", "Δ FLOW", "Z-SCORE σ",
+                      "COT / INST", "MOMENTUM", "PERSIST", "STATE", "SIGNAL")
+    for c = 0 to 9
+        table.cell(T, c, 2, array.get(hdrs, c),
+                   bgcolor=C_BG1, text_color=C_TXT, text_size=size.tiny)
+
+    // ── Rows 3–10: One per currency
+    ccys      = array.from("USD",    "EUR",    "GBP",    "AUD",
+                           "NZD",    "CAD",    "CHF",    "JPY")
+    csi_a     = array.from(csi_USD,  csi_EUR,  csi_GBP,  csi_AUD,
+                           csi_NZD,  csi_CAD,  csi_CHF,  csi_JPY)
+    net_a     = array.from(net_USD,  net_EUR,  net_GBP,  net_AUD,
+                           net_NZD,  net_CAD,  net_CHF,  net_JPY)
+    df_a      = array.from(df_USD,   df_EUR,   df_GBP,   df_AUD,
+                           df_NZD,   df_CAD,   df_CHF,   df_JPY)
+    dev_a     = array.from(dev_USD,  dev_EUR,  dev_GBP,  dev_AUD,
+                           dev_NZD,  dev_CAD,  dev_CHF,  dev_JPY)
+    cot_a     = array.from(cot_USD,  cot_EUR,  cot_GBP,  cot_AUD,
+                           cot_NZD,  cot_CAD,  cot_CHF,  cot_JPY)
+    mom_a     = array.from(mom_USD,  mom_EUR,  mom_GBP,  mom_AUD,
+                           mom_NZD,  mom_CAD,  mom_CHF,  mom_JPY)
+    pers_a    = array.from(pers_USD, pers_EUR, pers_GBP, pers_AUD,
+                           pers_NZD, pers_CAD, pers_CHF, pers_JPY)
+    comp_a    = array.from(comp_USD, comp_EUR, comp_GBP, comp_AUD,
+                           comp_NZD, comp_CAD, comp_CHF, comp_JPY)
+
+    for r = 0 to 7
+        row  = r + 3
+        rb   = r % 2 == 0 ? C_ROW0 : C_ROW1
+        cv   = array.get(comp_a, r)
+        dv   = array.get(dev_a,  r)
+        ctv  = array.get(cot_a,  r)
+        mv   = array.get(mom_a,  r)
+        pv   = array.get(pers_a, r)
+        nv   = array.get(net_a,  r)
+        dfv  = array.get(df_a,   r)
+        csiv = array.get(csi_a,  r)
+
+        mom_pfx = mv > 0 ? "▲ " : mv < 0 ? "▼ " : "= "
+        nv_pfx  = nv > 0 ? "+"  : ""
+        df_pfx  = dfv > 0 ? "+" : ""
+
+        table.cell(T, 0, row, array.get(ccys, r),
+                   bgcolor=f_score_bg(cv), text_color=C_TXT, text_size=size.small)
+        table.cell(T, 1, row, f_n1(csiv),
+                   bgcolor=f_score_bg((csiv - 50.0) / 50.0), text_color=C_TXT, text_size=size.tiny)
+        table.cell(T, 2, row, nv_pfx + f_n1(nv),
+                   bgcolor=f_score_bg(nv / 50.0), text_color=C_TXT, text_size=size.tiny)
+        table.cell(T, 3, row, df_pfx + f_n1(dfv),
+                   bgcolor=f_flow_bg(dfv), text_color=C_TXT, text_size=size.tiny)
+        table.cell(T, 4, row, f_n2(dv) + "σ  " + f_dev_label(dv, dev_thresh),
+                   bgcolor=f_dev_bg(dv, dev_thresh), text_color=C_TXT, text_size=size.tiny)
+        table.cell(T, 5, row, f_cot_label(ctv, use_real),
+                   bgcolor=f_score_bg(ctv / 50.0), text_color=C_TXT, text_size=size.tiny)
+        table.cell(T, 6, row, mom_pfx + f_n2(mv),
+                   bgcolor=f_score_bg(mv / 10.0), text_color=C_TXT, text_size=size.tiny)
+        table.cell(T, 7, row, str.tostring(pv),
+                   bgcolor=f_score_bg(float(pv) / float(pers_len)), text_color=C_TXT, text_size=size.tiny)
+        table.cell(T, 8, row, f_state(cv),
+                   bgcolor=f_score_bg(cv), text_color=C_TXT, text_size=size.tiny)
+        table.cell(T, 9, row, f_signal(cv),
+                   bgcolor=f_score_bg(cv), text_color=C_TXT, text_size=size.small)
+
+    // ── Row 11: Best pair opportunities panel (top long + top short)
+    // Sort by composite to find best bullish and bearish currency
+    // Simple: find max and min composite
+    max_comp = math.max(comp_USD, comp_EUR, comp_GBP, comp_AUD,
+                        comp_NZD, comp_CAD, comp_CHF, comp_JPY)
+    min_comp = math.min(comp_USD, comp_EUR, comp_GBP, comp_AUD,
+                        comp_NZD, comp_CAD, comp_CHF, comp_JPY)
+
+    best_bull = max_comp == comp_USD ? "USD" : max_comp == comp_EUR ? "EUR" :
+                max_comp == comp_GBP ? "GBP" : max_comp == comp_AUD ? "AUD" :
+                max_comp == comp_NZD ? "NZD" : max_comp == comp_CAD ? "CAD" :
+                max_comp == comp_CHF ? "CHF" : "JPY"
+    best_bear = min_comp == comp_USD ? "USD" : min_comp == comp_EUR ? "EUR" :
+                min_comp == comp_GBP ? "GBP" : min_comp == comp_AUD ? "AUD" :
+                min_comp == comp_NZD ? "NZD" : min_comp == comp_CAD ? "CAD" :
+                min_comp == comp_CHF ? "CHF" : "JPY"
+
+    best_spread = max_comp - min_comp
+    best_pair   = best_bull + best_bear
+    opp_label   = "🔎 TOP SETUP: " + best_pair + "  SPREAD:" + f_n2(best_spread) +
+                  "  (" + best_bull + " LONG vs " + best_bear + " SHORT)"
+
+    table.cell(T, 0, 11, opp_label, bgcolor=color.new(#1f3a4f, 0),
+               text_color=color.new(#58a6ff, 0), text_size=size.tiny,
+               text_halign=text.align_center)
+    table.merge_cells(T, 0, 11, 9, 11)
+
+    // ── Row 12: Weight legend / footer
+    w_info = "Weights — Strength:" + f_n1(w_str * 100) + "%  Dev:" + f_n1(w_dev * 100) +
+             "%  Mom:" + f_n1(w_mom * 100) + "%  Persist:" + f_n1(w_pers * 100) +
+             "%  COT:" + f_n1(w_cot_eff * 100) + "%   |  EDI v1.0"
+    table.cell(T, 0, 12, w_info, bgcolor=C_BG0,
+               text_color=C_SILVER, text_size=size.tiny, text_halign=text.align_center)
+    table.merge_cells(T, 0, 12, 9, 12)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ALERTS
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+alertcondition(edi_spread >  0.5, "EDI Strong Bull", "EDI: Strong bullish spread on " + sym_upper)
+alertcondition(edi_spread < -0.5, "EDI Strong Bear", "EDI: Strong bearish spread on " + sym_upper)
+alertcondition(ta.crossover (edi_spread, 0.0), "EDI Bull Cross", "EDI: Crossed into bullish – " + sym_upper)
+alertcondition(ta.crossunder(edi_spread, 0.0), "EDI Bear Cross", "EDI: Crossed into bearish – " + sym_upper)
+alertcondition(any_extreme, "EDI Extreme Deviation",
+     "EDI: At least one currency at extreme Z-score deviation – check matrix")
+alertcondition(ta.crossover(edi_spread,  0.5) or ta.crossunder(edi_spread, -0.5),
+     "EDI Strong Signal Entry", "EDI: Entered strong signal zone on " + sym_upper)
