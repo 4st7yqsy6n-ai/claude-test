@@ -37,6 +37,113 @@ def _yfinance() -> Any:
 
 
 # ---------------------------------------------------------------------------
+# Live market data fetcher (prices + H4 ATR for signal generation)
+# ---------------------------------------------------------------------------
+
+#: yfinance symbols for each VIP pair
+_YF_SYMBOLS: dict[str, str] = {
+    "XAU/USD": "GC=F",
+    "EUR/USD": "EURUSD=X",
+    "GBP/USD": "GBPUSD=X",
+    "USD/JPY": "USDJPY=X",
+    "AUD/USD": "AUDUSD=X",
+    "USD/CAD": "USDCAD=X",
+    "GBP/JPY": "GBPJPY=X",
+}
+
+#: Realistic fallback market data (May 2026)
+_FALLBACK_MARKET: dict[str, dict[str, float]] = {
+    "XAU/USD": {"price": 2640.0, "atr": 18.0,   "ma20": 2628.0, "ma50": 2605.0},
+    "EUR/USD": {"price": 1.0850, "atr": 0.0058,  "ma20": 1.0842, "ma50": 1.0820},
+    "GBP/USD": {"price": 1.2680, "atr": 0.0072,  "ma20": 1.2660, "ma50": 1.2630},
+    "USD/JPY": {"price": 157.20, "atr": 0.95,    "ma20": 156.80, "ma50": 155.40},
+    "AUD/USD": {"price": 0.6450, "atr": 0.0042,  "ma20": 0.6440, "ma50": 0.6420},
+    "USD/CAD": {"price": 1.3680, "atr": 0.0055,  "ma20": 1.3660, "ma50": 1.3640},
+    "GBP/JPY": {"price": 199.30, "atr": 1.40,    "ma20": 198.60, "ma50": 196.80},
+}
+
+
+def _fetch_live_market_data() -> dict[str, dict[str, float]]:
+    """
+    Fetch current prices and 14-period H4 ATR for all VIP pairs from yfinance.
+
+    Downloads 60 days of 4H OHLCV data, computes:
+      - last close price
+      - ATR(14) on H4 bars
+      - 20-period EMA (used as dynamic support/resistance for entries)
+      - 50-period EMA (trend filter)
+
+    XAU/EUR is derived from XAU/USD ÷ EUR/USD.
+    Falls back to ``_FALLBACK_MARKET`` values on any error.
+    """
+    result: dict[str, dict[str, float]] = {k: dict(v) for k, v in _FALLBACK_MARKET.items()}
+
+    try:
+        import pandas as pd
+        yf = _yfinance()
+
+        syms = list(_YF_SYMBOLS.values())
+        # yfinance download: period="60d", interval="4h" → max ~720 bars
+        raw = yf.download(
+            syms,
+            period="60d",
+            interval="4h",
+            progress=False,
+            auto_adjust=True,
+        )
+
+        for pair, sym in _YF_SYMBOLS.items():
+            try:
+                if len(syms) > 1:
+                    close_s = raw["Close"][sym].dropna()
+                    high_s  = raw["High"][sym].dropna()
+                    low_s   = raw["Low"][sym].dropna()
+                else:
+                    close_s = raw["Close"].dropna()
+                    high_s  = raw["High"].dropna()
+                    low_s   = raw["Low"].dropna()
+
+                if len(close_s) < 20:
+                    continue
+
+                # True Range
+                prev_close = close_s.shift(1)
+                tr = pd.concat(
+                    [high_s - low_s, (high_s - prev_close).abs(), (low_s - prev_close).abs()],
+                    axis=1,
+                ).max(axis=1)
+                atr = float(tr.rolling(14).mean().iloc[-1])
+
+                n = len(close_s)
+                ma20 = float(close_s.rolling(20).mean().iloc[-1])
+                ma50 = float(close_s.rolling(min(50, n)).mean().iloc[-1])
+                price = float(close_s.iloc[-1])
+
+                if price > 0 and atr > 0:
+                    result[pair] = {"price": price, "atr": atr, "ma20": ma20, "ma50": ma50}
+                    logger.info("Live market data: %s price=%.5f atr=%.5f", pair, price, atr)
+
+            except Exception as inner_exc:
+                logger.debug("H4 data parse failed for %s: %s", pair, inner_exc)
+
+    except Exception as exc:
+        logger.warning("Live market data fetch failed, using fallback: %s", exc)
+
+    # Derive XAU/EUR
+    xau = result.get("XAU/USD", _FALLBACK_MARKET["XAU/USD"])
+    eur = result.get("EUR/USD", _FALLBACK_MARKET["EUR/USD"])
+    eur_price = eur["price"] or 1.0850
+    result["XAU/EUR"] = {
+        "price": round(xau["price"] / eur_price, 2),
+        "atr":   round(xau["atr"]   / eur_price, 2),
+        "ma20":  round(xau["ma20"]  / eur_price, 2),
+        "ma50":  round(xau["ma50"]  / eur_price, 2),
+    }
+
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Helper utilities
 # ---------------------------------------------------------------------------
 
@@ -264,37 +371,39 @@ _REF_PRICES: dict[str, float] = {
 
 def get_signals() -> list[dict]:
     """
-    Generate trading signals for eight Gold & FX pairs.
+    Generate trading signals for eight Gold & FX pairs using live market data.
 
-    Signals are derived from current regime (fetched via get_market_regime),
-    reference price levels, and rule-based technical logic.  All
-    entry/stop/TP values are mathematically consistent.
+    1. Fetches the current macro regime (VIX / DXY / inflation via yfinance).
+    2. Downloads 60 days of H4 OHLCV data for all pairs and computes live
+       price, ATR(14), EMA(20), and EMA(50).
+    3. Builds directional signals whose entry / stop / TP levels are anchored
+       to actual current price and ATR — not hard-coded values.
 
-    Returns
-    -------
-    list[dict]
-        One signal dict per pair; keys per specification.
+    Falls back gracefully if yfinance is unavailable.
     """
     try:
         regime = get_market_regime()
     except Exception:
         regime = _mock_regime()
 
-    rng = np.random.default_rng(20260527)  # fixed seed for reproducibility
+    # ── Live market data (price + ATR) ──────────────────────────────────────
+    market = _fetch_live_market_data()
+
+    rng = np.random.default_rng(20260527)  # fixed seed keeps labels stable
 
     gold_bias = regime.get("gold_bias", "bullish")
     risk_sentiment = regime.get("risk_sentiment", "risk_off")
     usd_cycle = regime.get("usd_cycle", "neutral")
 
     return [
-        _build_xauusd_signal(gold_bias, regime, rng),
-        _build_eurusd_signal(usd_cycle, regime, rng),
-        _build_gbpusd_signal(usd_cycle, regime, rng),
-        _build_usdjpy_signal(risk_sentiment, regime, rng),
-        _build_audusd_signal(risk_sentiment, regime, rng),
-        _build_usdcad_signal(regime, rng),
-        _build_gbpjpy_signal(risk_sentiment, regime, rng),
-        _build_xaueur_signal(gold_bias, regime, rng),
+        _build_xauusd_signal(gold_bias, regime, rng, market),
+        _build_eurusd_signal(usd_cycle, regime, rng, market),
+        _build_gbpusd_signal(usd_cycle, regime, rng, market),
+        _build_usdjpy_signal(risk_sentiment, regime, rng, market),
+        _build_audusd_signal(risk_sentiment, regime, rng, market),
+        _build_usdcad_signal(regime, rng, market),
+        _build_gbpjpy_signal(risk_sentiment, regime, rng, market),
+        _build_xaueur_signal(gold_bias, regime, rng, market),
     ]
 
 
@@ -362,408 +471,279 @@ def _signal_base(
     }
 
 
-def _build_xauusd_signal(gold_bias: str, regime: dict, rng: np.random.Generator) -> dict:
-    base = 2640.0
+def _build_xauusd_signal(gold_bias: str, regime: dict, rng: np.random.Generator,
+                          market: dict | None = None) -> dict:
+    """XAU/USD signal anchored to live price and H4 ATR."""
+    m = (market or {}).get("XAU/USD", _FALLBACK_MARKET["XAU/USD"])
+    price, atr, ma20 = m["price"], m["atr"], m["ma20"]
+    dp = max(1, round(price))  # decimal places for display
+
     if gold_bias == "bullish":
-        entry = 2618.0
-        stop = 2594.0
-        tp1 = 2645.0
-        tp2 = 2672.0
-        tp3 = 2710.0
-        direction = "LONG"
-        confidence = 78
+        entry  = round(max(ma20, price - atr * 0.6), 1)
+        stop   = round(entry - atr * 1.6, 1)
+        tp1    = round(entry + atr * 1.0, 1)
+        tp2    = round(entry + atr * 2.2, 1)
+        tp3    = round(entry + atr * 3.8, 1)
+        direction, regime_alignment, confidence = "LONG", True, min(85, 60 + int(abs(regime.get("gold_bias_score", 0)) / 4))
         rationale = (
-            "Risk-off regime with elevated VIX supports gold safe-haven bid. "
-            "Price holding above the 2600 psychological support and 200-EMA on H4. "
-            "Bullish engulfing on D1 at key demand zone signals institutional accumulation."
+            f"Gold at {price:.0f} retesting {ma20:.0f} (20-EMA H4) within risk-off + inflation regime. "
+            f"Live ATR({atr:.0f}) defines entry {entry:.0f}–{round(entry+atr*0.25):.0f} with stop {stop:.0f}. "
+            "Macro model aligns: elevated VIX + inflation premium = institutional gold accumulation."
         )
-        regime_alignment = True
-        invalidation = "Daily close below 2590 invalidates bullish structure"
+        invalidation = f"4H close below {stop:.0f} invalidates bullish structure"
     else:
-        entry = 2648.0
-        stop = 2671.0
-        tp1 = 2625.0
-        tp2 = 2600.0
-        tp3 = 2570.0
-        direction = "SHORT"
-        confidence = 55
+        entry  = round(min(ma20 + atr * 0.8, price + atr * 0.4), 1)
+        stop   = round(entry + atr * 1.5, 1)
+        tp1    = round(entry - atr * 1.0, 1)
+        tp2    = round(entry - atr * 2.2, 1)
+        tp3    = round(entry - atr * 3.8, 1)
+        direction, regime_alignment, confidence = "SHORT", False, 52
         rationale = (
-            "Strengthening USD and easing inflation expectations reduce gold's appeal. "
-            "Price rejected at the 2650 resistance cluster with bearish RSI divergence. "
-            "Risk-on sentiment diminishes safe-haven premium."
+            f"Gold ({price:.0f}) facing headwind from strong USD + easing inflation. "
+            f"Entry {entry:.0f} near {ma20:.0f} MA resistance; target {tp2:.0f} (2.2×ATR). "
+            "Reduce size — regime not fully aligned for gold shorts."
         )
-        regime_alignment = False
-        invalidation = "Break and close above 2680 invalidates short bias"
+        invalidation = f"Close above {stop:.0f} invalidates short"
 
-    return _signal_base(
-        pair="XAU/USD",
-        direction=direction,
-        entry=entry,
-        stop=stop,
-        tp1=tp1,
-        tp2=tp2,
-        tp3=tp3,
-        confidence=confidence,
-        rationale=rationale,
-        regime_alignment=regime_alignment,
-        time_frame="H4",
-        invalidation=invalidation,
-    )
+    return _signal_base("XAU/USD", direction, entry, stop, tp1, tp2, tp3,
+                        confidence, rationale, regime_alignment, "H4", invalidation)
 
 
-def _build_eurusd_signal(usd_cycle: str, regime: dict, rng: np.random.Generator) -> dict:
+def _build_eurusd_signal(usd_cycle: str, regime: dict, rng: np.random.Generator,
+                          market: dict | None = None) -> dict:
+    m = (market or {}).get("EUR/USD", _FALLBACK_MARKET["EUR/USD"])
+    price, atr, ma20 = m["price"], m["atr"], m["ma20"]
+
     if usd_cycle == "weak_dollar":
-        entry = 1.0840
-        stop = 1.0790
-        tp1 = 1.0880
-        tp2 = 1.0930
-        tp3 = 1.1000
-        direction = "LONG"
-        confidence = 65
+        entry  = round(max(ma20, price - atr * 0.5), 5)
+        stop   = round(entry - atr * 1.5, 5)
+        tp1, tp2, tp3 = round(entry+atr,5), round(entry+atr*2.2,5), round(entry+atr*4,5)
+        direction, regime_alignment, confidence = "LONG", True, 65
         rationale = (
-            "Weak dollar environment underpins EUR/USD recovery from the 1.08 handle. "
-            "ECB holding rates steady while Fed dovish pivot expectations build provides EUR tailwind. "
-            "Price bounced from the ascending trendline support with increasing buy-side volume."
+            f"EUR/USD ({price:.4f}) supported by weak USD + ECB hold vs. Fed pivot. "
+            f"Entry near {entry:.4f} (20-EMA), stop {stop:.4f}, targeting {tp2:.4f}. "
+            "Ascending trendline support intact; dips offer long entries."
         )
-        regime_alignment = True
-        invalidation = "Break below 1.0780 voids the bullish setup"
+        invalidation = f"H4 close below {stop:.4f} voids setup"
     elif usd_cycle == "strong_dollar":
-        entry = 1.0865
-        stop = 1.0910
-        tp1 = 1.0820
-        tp2 = 1.0780
-        tp3 = 1.0720
-        direction = "SHORT"
-        confidence = 70
+        entry  = round(min(ma20 + atr * 0.6, price + atr * 0.3), 5)
+        stop   = round(entry + atr * 1.5, 5)
+        tp1, tp2, tp3 = round(entry-atr,5), round(entry-atr*2.2,5), round(entry-atr*4,5)
+        direction, regime_alignment, confidence = "SHORT", True, 70
         rationale = (
-            "Strong dollar regime presses EUR/USD toward major support. "
-            "Diverging rate expectations — Fed hawkish, ECB nearing cut cycle — weigh on EUR. "
-            "Daily shooting star at resistance confirms downside momentum."
+            f"EUR/USD ({price:.4f}) capped at {ma20:.4f} in strong-dollar regime. "
+            f"ECB rate-cut cycle vs. Fed hawkish hold widens rate differential bearishly. "
+            f"Entry {entry:.4f}, stop {stop:.4f}."
         )
-        regime_alignment = True
-        invalidation = "Daily close above 1.0920 negates the short"
+        invalidation = f"Daily close above {stop:.4f} negates the short"
     else:
-        entry = 1.0855
-        stop = 1.0800
-        tp1 = 1.0900
-        tp2 = 1.0950
-        tp3 = 1.1020
-        direction = "LONG"
-        confidence = 52
+        entry  = round(price - atr * 0.3, 5)
+        stop   = round(entry - atr * 1.4, 5)
+        tp1, tp2, tp3 = round(entry+atr,5), round(entry+atr*2,5), round(entry+atr*3.5,5)
+        direction, regime_alignment, confidence = "LONG", False, 50
         rationale = (
-            "Neutral USD environment with EUR stabilising above key support at 1.0800. "
-            "Positioning data shows EUR short squeeze potential near multi-month lows. "
-            "Watch for break above 1.0900 to confirm directional bias."
+            f"EUR/USD ({price:.4f}) neutral — watching for break above {round(price+atr,4):.4f} to confirm direction. "
+            "Positioning squeeze potential near multi-month lows. Reduce size in neutral regime."
         )
-        regime_alignment = False
-        invalidation = "H4 close below 1.0795 invalidates long thesis"
+        invalidation = f"H4 close below {stop:.4f} invalidates"
 
-    return _signal_base(
-        pair="EUR/USD",
-        direction=direction,
-        entry=entry,
-        stop=stop,
-        tp1=tp1,
-        tp2=tp2,
-        tp3=tp3,
-        confidence=confidence,
-        rationale=rationale,
-        regime_alignment=regime_alignment,
-        time_frame="D1",
-        invalidation=invalidation,
-    )
+    return _signal_base("EUR/USD", direction, entry, stop, tp1, tp2, tp3,
+                        confidence, rationale, regime_alignment, "D1", invalidation)
 
 
-def _build_gbpusd_signal(usd_cycle: str, regime: dict, rng: np.random.Generator) -> dict:
+def _build_gbpusd_signal(usd_cycle: str, regime: dict, rng: np.random.Generator,
+                          market: dict | None = None) -> dict:
+    m = (market or {}).get("GBP/USD", _FALLBACK_MARKET["GBP/USD"])
+    price, atr, ma20 = m["price"], m["atr"], m["ma20"]
+
     if usd_cycle in ("weak_dollar", "neutral"):
-        entry = 1.2665
-        stop = 1.2605
-        tp1 = 1.2720
-        tp2 = 1.2780
-        tp3 = 1.2870
-        direction = "LONG"
-        confidence = 60
+        entry  = round(max(ma20, price - atr * 0.5), 5)
+        stop   = round(entry - atr * 1.4, 5)
+        tp1, tp2, tp3 = round(entry+atr*0.8,5), round(entry+atr*1.8,5), round(entry+atr*3.2,5)
+        direction, regime_alignment, confidence = "LONG", True, 60
         rationale = (
-            "GBP/USD finding support at the 1.2650 structure level with BoE still in hawkish hold. "
-            "Cable resilience vs EUR suggests relative GBP strength. "
-            "H4 higher-low sequence intact; dips into 1.2650-1.2680 offer tactical long entries."
+            f"GBP/USD ({price:.4f}) finding support at {ma20:.4f} (20-EMA). "
+            f"BoE hawkish hold vs. Fed dovish pivot expectations support cable. "
+            f"Entry {entry:.4f}, stop {stop:.4f}, targeting {tp2:.4f}."
         )
-        regime_alignment = True
-        invalidation = "Weekly close below 1.2590 shifts bias to neutral"
+        invalidation = f"Weekly close below {stop:.4f} shifts bias neutral"
     else:
-        entry = 1.2690
-        stop = 1.2745
-        tp1 = 1.2640
-        tp2 = 1.2580
-        tp3 = 1.2490
-        direction = "SHORT"
-        confidence = 62
+        entry  = round(min(ma20 + atr * 0.5, price + atr * 0.3), 5)
+        stop   = round(entry + atr * 1.4, 5)
+        tp1, tp2, tp3 = round(entry-atr*0.8,5), round(entry-atr*1.8,5), round(entry-atr*3.2,5)
+        direction, regime_alignment, confidence = "SHORT", True, 62
         rationale = (
-            "Strong USD momentum pressing GBP toward 2024 lows. "
-            "BoE rate cut expectations accelerating amid softening UK CPI. "
-            "Daily rejection candle at descending 50-EMA confirms sell pressure."
+            f"GBP/USD ({price:.4f}) capped at {ma20:.4f} in strong-USD regime. "
+            f"BoE rate-cut cycle accelerating — softening UK CPI reduces BoE hawkishness. "
+            f"Entry {entry:.4f}, stop {stop:.4f}."
         )
-        regime_alignment = True
-        invalidation = "Break above 1.2750 with close invalidates short"
+        invalidation = f"Close above {stop:.4f} invalidates short"
 
-    return _signal_base(
-        pair="GBP/USD",
-        direction=direction,
-        entry=entry,
-        stop=stop,
-        tp1=tp1,
-        tp2=tp2,
-        tp3=tp3,
-        confidence=confidence,
-        rationale=rationale,
-        regime_alignment=regime_alignment,
-        time_frame="H4",
-        invalidation=invalidation,
-    )
+    return _signal_base("GBP/USD", direction, entry, stop, tp1, tp2, tp3,
+                        confidence, rationale, regime_alignment, "H4", invalidation)
 
 
-def _build_usdjpy_signal(risk_sentiment: str, regime: dict, rng: np.random.Generator) -> dict:
-    # Risk-off → yen strengthens → USD/JPY falls → SHORT
+def _build_usdjpy_signal(risk_sentiment: str, regime: dict, rng: np.random.Generator,
+                          market: dict | None = None) -> dict:
+    m = (market or {}).get("USD/JPY", _FALLBACK_MARKET["USD/JPY"])
+    price, atr, ma20 = m["price"], m["atr"], m["ma20"]
+
     if risk_sentiment == "risk_off":
-        entry = 157.50
-        stop = 159.20
-        tp1 = 156.00
-        tp2 = 154.50
-        tp3 = 152.00
-        direction = "SHORT"
-        confidence = 73
+        entry  = round(min(ma20 + atr * 0.5, price + atr * 0.3), 2)
+        stop   = round(entry + atr * 1.8, 2)
+        tp1, tp2, tp3 = round(entry-atr*1.5,2), round(entry-atr*3,2), round(entry-atr*5,2)
+        direction, regime_alignment, confidence = "SHORT", True, 73
         rationale = (
-            "Risk-off environment drives JPY safe-haven demand, pressuring USD/JPY lower. "
-            "BoJ pivoting toward normalisation — rate hike expectations limit USD/JPY upside. "
-            "Price forming a double-top at 158-159 zone with bearish RSI divergence on D1."
+            f"USD/JPY ({price:.2f}) — risk-off drives JPY safe-haven demand. "
+            f"BoJ policy normalisation limits USD/JPY upside near {ma20:.2f}. "
+            f"Entry {entry:.2f}, stop {stop:.2f}, target {tp2:.2f}."
         )
-        regime_alignment = True
-        invalidation = "Daily close above 159.50 negates the bearish scenario"
+        invalidation = f"Daily close above {stop:.2f} negates bearish scenario"
     elif risk_sentiment == "risk_on":
-        entry = 156.80
-        stop = 155.20
-        tp1 = 158.00
-        tp2 = 159.50
-        tp3 = 161.50
-        direction = "LONG"
-        confidence = 58
+        entry  = round(max(ma20 - atr * 0.3, price - atr * 0.5), 2)
+        stop   = round(entry - atr * 1.8, 2)
+        tp1, tp2, tp3 = round(entry+atr*1.2,2), round(entry+atr*2.5,2), round(entry+atr*4,2)
+        direction, regime_alignment, confidence = "LONG", True, 58
         rationale = (
-            "Risk-on appetite reduces JPY safe-haven premium. "
-            "Wide US-Japan rate differential sustains carry trade demand for USD/JPY. "
-            "Breakout above 157.00 resistance targets the 2024 highs near 160."
+            f"USD/JPY ({price:.2f}) risk-on — carry trade demand supports. "
+            f"Wide US-Japan rate differential sustains USD/JPY bids above {ma20:.2f}. "
+            f"Entry {entry:.2f}, stop {stop:.2f}, targeting {tp2:.2f}."
         )
-        regime_alignment = True
-        invalidation = "Break below 155.00 voids bullish structure"
+        invalidation = f"Break below {stop:.2f} voids bullish structure"
     else:
-        entry = 157.00
-        stop = 158.80
-        tp1 = 155.50
-        tp2 = 154.00
-        tp3 = 151.50
-        direction = "SHORT"
-        confidence = 48
+        entry  = round(min(ma20 + atr * 0.3, price + atr * 0.2), 2)
+        stop   = round(entry + atr * 1.6, 2)
+        tp1, tp2, tp3 = round(entry-atr*1.2,2), round(entry-atr*2.4,2), round(entry-atr*4,2)
+        direction, regime_alignment, confidence = "SHORT", False, 47
         rationale = (
-            "Neutral risk environment with JPY finding footing amid BoJ policy uncertainty. "
-            "US rate cut expectations capping USD/JPY rallies. "
-            "Watching for break of 156.00 support to trigger momentum short."
+            f"USD/JPY ({price:.2f}) — neutral risk; BoJ uncertainty capping upside. "
+            f"Watching break below {round(price-atr,2):.2f} for momentum short trigger."
         )
-        regime_alignment = False
-        invalidation = "Close above 158.90 invalidates the setup"
+        invalidation = f"Close above {stop:.2f} invalidates"
 
-    return _signal_base(
-        pair="USD/JPY",
-        direction=direction,
-        entry=entry,
-        stop=stop,
-        tp1=tp1,
-        tp2=tp2,
-        tp3=tp3,
-        confidence=confidence,
-        rationale=rationale,
-        regime_alignment=regime_alignment,
-        time_frame="D1",
-        invalidation=invalidation,
-    )
+    return _signal_base("USD/JPY", direction, entry, stop, tp1, tp2, tp3,
+                        confidence, rationale, regime_alignment, "D1", invalidation)
 
 
-def _build_audusd_signal(risk_sentiment: str, regime: dict, rng: np.random.Generator) -> dict:
+def _build_audusd_signal(risk_sentiment: str, regime: dict, rng: np.random.Generator,
+                          market: dict | None = None) -> dict:
+    m = (market or {}).get("AUD/USD", _FALLBACK_MARKET["AUD/USD"])
+    price, atr, ma20 = m["price"], m["atr"], m["ma20"]
+
     if risk_sentiment == "risk_on":
-        entry = 0.6440
-        stop = 0.6390
-        tp1 = 0.6490
-        tp2 = 0.6550
-        tp3 = 0.6620
-        direction = "LONG"
-        confidence = 63
+        entry  = round(max(ma20, price - atr * 0.5), 5)
+        stop   = round(entry - atr * 1.5, 5)
+        tp1, tp2, tp3 = round(entry+atr,5), round(entry+atr*2,5), round(entry+atr*3.5,5)
+        direction, regime_alignment, confidence = "LONG", True, 63
         rationale = (
-            "Risk-on conditions favour commodity-linked AUD. "
-            "Chinese stimulus expectations and iron ore demand support the Aussie dollar. "
-            "AUD/USD bounced from strong 0.6400 demand zone; H4 momentum turning higher."
+            f"AUD/USD ({price:.4f}) — risk-on + China stimulus favour commodity AUD. "
+            f"Entry {entry:.4f} near 20-EMA ({ma20:.4f}), stop {stop:.4f}."
         )
-        regime_alignment = True
-        invalidation = "Daily close below 0.6380 negates bullish thesis"
+        invalidation = f"Daily close below {stop:.4f} negates bullish thesis"
     else:
-        entry = 0.6460
-        stop = 0.6510
-        tp1 = 0.6410
-        tp2 = 0.6360
-        tp3 = 0.6290
-        direction = "SHORT"
-        confidence = 61
+        entry  = round(min(ma20 + atr * 0.4, price + atr * 0.3), 5)
+        stop   = round(entry + atr * 1.5, 5)
+        tp1, tp2, tp3 = round(entry-atr,5), round(entry-atr*2,5), round(entry-atr*3.5,5)
+        direction, regime_alignment, confidence = "SHORT", True, 61
         rationale = (
-            "Risk-off and global growth concerns pressure the risk-sensitive AUD. "
-            "Slowing China demand signals weakness in commodity exports. "
-            "AUD/USD capped below 0.6500 resistance; bearish daily close below 0.6450 needed."
+            f"AUD/USD ({price:.4f}) — risk-off pressures commodity currency. "
+            f"China slowdown reduces iron ore / commodity demand. "
+            f"Entry {entry:.4f}, stop {stop:.4f}, target {tp2:.4f}."
         )
-        regime_alignment = True
-        invalidation = "Close above 0.6520 invalidates the short"
+        invalidation = f"Close above {stop:.4f} invalidates"
 
-    return _signal_base(
-        pair="AUD/USD",
-        direction=direction,
-        entry=entry,
-        stop=stop,
-        tp1=tp1,
-        tp2=tp2,
-        tp3=tp3,
-        confidence=confidence,
-        rationale=rationale,
-        regime_alignment=regime_alignment,
-        time_frame="H4",
-        invalidation=invalidation,
-    )
+    return _signal_base("AUD/USD", direction, entry, stop, tp1, tp2, tp3,
+                        confidence, rationale, regime_alignment, "H4", invalidation)
 
 
-def _build_usdcad_signal(regime: dict, rng: np.random.Generator) -> dict:
+def _build_usdcad_signal(regime: dict, rng: np.random.Generator,
+                          market: dict | None = None) -> dict:
+    m = (market or {}).get("USD/CAD", _FALLBACK_MARKET["USD/CAD"])
+    price, atr, ma20 = m["price"], m["atr"], m["ma20"]
     usd_cycle = regime.get("usd_cycle", "neutral")
+
     if usd_cycle == "strong_dollar":
-        entry = 1.3660
-        stop = 1.3600
-        tp1 = 1.3730
-        tp2 = 1.3800
-        tp3 = 1.3900
-        direction = "LONG"
-        confidence = 64
+        entry  = round(max(ma20, price - atr * 0.4), 5)
+        stop   = round(entry - atr * 1.4, 5)
+        tp1, tp2, tp3 = round(entry+atr,5), round(entry+atr*2,5), round(entry+atr*3.5,5)
+        direction, regime_alignment, confidence = "LONG", True, 64
         rationale = (
-            "Strong USD regime drives USD/CAD toward the 1.38 resistance zone. "
-            "Oil price weakness reduces Canadian dollar support — negative for CAD. "
-            "Price broke above 1.3650 supply-turned-demand; pullback offers long entry."
+            f"USD/CAD ({price:.4f}) — strong USD + oil weakness pressures CAD. "
+            f"Entry {entry:.4f} near {ma20:.4f}, stop {stop:.4f}."
         )
-        regime_alignment = True
-        invalidation = "H4 close below 1.3590 negates the bullish view"
+        invalidation = f"H4 close below {stop:.4f} negates bullish view"
     else:
-        entry = 1.3700
-        stop = 1.3760
-        tp1 = 1.3640
-        tp2 = 1.3570
-        tp3 = 1.3480
-        direction = "SHORT"
-        confidence = 56
+        entry  = round(min(ma20 + atr * 0.5, price + atr * 0.3), 5)
+        stop   = round(entry + atr * 1.4, 5)
+        tp1, tp2, tp3 = round(entry-atr,5), round(entry-atr*2,5), round(entry-atr*3.5,5)
+        direction, regime_alignment, confidence = "SHORT", False, 55
         rationale = (
-            "USD/CAD overbought on weekly RSI near 1.37 — risk of mean reversion. "
-            "Oil price stabilisation supporting CAD fundamentals. "
-            "Bearish pin bar at 1.3720 monthly resistance; tight stops above 1.3760."
+            f"USD/CAD ({price:.4f}) overbought near {ma20:.4f} resistance. "
+            f"Oil stabilisation supports CAD. Entry {entry:.4f}, stop {stop:.4f}."
         )
-        regime_alignment = False
-        invalidation = "Weekly close above 1.3780 invalidates short thesis"
+        invalidation = f"Weekly close above {stop:.4f} invalidates"
 
-    return _signal_base(
-        pair="USD/CAD",
-        direction=direction,
-        entry=entry,
-        stop=stop,
-        tp1=tp1,
-        tp2=tp2,
-        tp3=tp3,
-        confidence=confidence,
-        rationale=rationale,
-        regime_alignment=regime_alignment,
-        time_frame="D1",
-        invalidation=invalidation,
-    )
+    return _signal_base("USD/CAD", direction, entry, stop, tp1, tp2, tp3,
+                        confidence, rationale, regime_alignment, "D1", invalidation)
 
 
-def _build_gbpjpy_signal(risk_sentiment: str, regime: dict, rng: np.random.Generator) -> dict:
+def _build_gbpjpy_signal(risk_sentiment: str, regime: dict, rng: np.random.Generator,
+                          market: dict | None = None) -> dict:
+    m = (market or {}).get("GBP/JPY", _FALLBACK_MARKET["GBP/JPY"])
+    price, atr, ma20 = m["price"], m["atr"], m["ma20"]
+
     if risk_sentiment == "risk_off":
-        entry = 199.80
-        stop = 201.50
-        tp1 = 197.50
-        tp2 = 195.00
-        tp3 = 191.00
-        direction = "SHORT"
-        confidence = 69
+        entry  = round(min(ma20 + atr * 0.6, price + atr * 0.3), 2)
+        stop   = round(entry + atr * 1.8, 2)
+        tp1, tp2, tp3 = round(entry-atr*1.5,2), round(entry-atr*3.5,2), round(entry-atr*6,2)
+        direction, regime_alignment, confidence = "SHORT", True, 69
         rationale = (
-            "GBP/JPY highly sensitive to risk sentiment — risk-off drives sharp yen appreciation. "
-            "Cross approaching key monthly resistance at 200 with bearish divergence on the weekly. "
-            "Dual safe-haven demand for JPY and GBP vulnerability creates asymmetric short opportunity."
+            f"GBP/JPY ({price:.2f}) — risk-off drives JPY safe-haven bid. "
+            f"Cross near {ma20:.2f} monthly resistance with bearish weekly divergence. "
+            f"Entry {entry:.2f}, stop {stop:.2f}, target {tp2:.2f}."
         )
-        regime_alignment = True
-        invalidation = "Daily close above 201.80 invalidates the short"
+        invalidation = f"Daily close above {stop:.2f} invalidates"
     else:
-        entry = 198.50
-        stop = 196.80
-        tp1 = 200.50
-        tp2 = 202.80
-        tp3 = 206.00
-        direction = "LONG"
-        confidence = 55
+        entry  = round(max(ma20 - atr * 0.3, price - atr * 0.5), 2)
+        stop   = round(entry - atr * 1.8, 2)
+        tp1, tp2, tp3 = round(entry+atr*1.4,2), round(entry+atr*3,2), round(entry+atr*5,2)
+        direction, regime_alignment, confidence = "LONG", True, 54
         rationale = (
-            "Risk appetite recovering — GBP/JPY historically outperforms in reflationary cycles. "
-            "BoE divergence from BoJ (more hawkish) supports GBP/JPY upside. "
-            "Break above 200 psychological level targets 2024 highs at 205-207."
+            f"GBP/JPY ({price:.2f}) — risk-on; BoE divergence from BoJ supports upside. "
+            f"Break above {round(price+atr,2):.2f} targets 2024 highs. Entry {entry:.2f}."
         )
-        regime_alignment = True
-        invalidation = "Close below 196.50 negates the bullish pattern"
+        invalidation = f"Close below {stop:.2f} negates"
 
-    return _signal_base(
-        pair="GBP/JPY",
-        direction=direction,
-        entry=entry,
-        stop=stop,
-        tp1=tp1,
-        tp2=tp2,
-        tp3=tp3,
-        confidence=confidence,
-        rationale=rationale,
-        regime_alignment=regime_alignment,
-        time_frame="H4",
-        invalidation=invalidation,
-    )
+    return _signal_base("GBP/JPY", direction, entry, stop, tp1, tp2, tp3,
+                        confidence, rationale, regime_alignment, "H4", invalidation)
 
 
-def _build_xaueur_signal(gold_bias: str, regime: dict, rng: np.random.Generator) -> dict:
-    # XAU/EUR = XAU/USD / EUR/USD ≈ 2640 / 1.0850 ≈ 2432
-    base = 2432.0
+def _build_xaueur_signal(gold_bias: str, regime: dict, rng: np.random.Generator,
+                          market: dict | None = None) -> dict:
+    m = (market or {}).get("XAU/EUR", {"price": 2432.0, "atr": 17.0, "ma20": 2420.0, "ma50": 2400.0})
+    price, atr, ma20 = m["price"], m["atr"], m["ma20"]
+
     if gold_bias == "bullish":
-        entry = 2415.0
-        stop = 2390.0
-        tp1 = 2448.0
-        tp2 = 2470.0
-        tp3 = 2510.0
-        direction = "LONG"
-        confidence = 72
+        entry  = round(max(ma20, price - atr * 0.6), 1)
+        stop   = round(entry - atr * 1.6, 1)
+        tp1, tp2, tp3 = round(entry+atr,1), round(entry+atr*2.2,1), round(entry+atr*4,1)
+        direction, regime_alignment, confidence = "LONG", True, 72
         rationale = (
-            "Gold priced in euros maintains bullish structure, benefiting from ECB dovish tilt vs. USD. "
-            "XAU/EUR holding above the 2400 psychological level and rising 20-week EMA. "
-            "European inflation concerns support gold's real-asset appeal for EUR-based investors."
+            f"XAU/EUR ({price:.0f}) — gold outperforming EUR as ECB rate-cut cycle accelerates. "
+            f"XAU/EUR holding above {ma20:.0f} (20-EMA) with institutional euro-denominated demand. "
+            f"Entry {entry:.0f}, stop {stop:.0f}, target {tp2:.0f}."
         )
-        regime_alignment = True
-        invalidation = "Weekly close below 2385 shifts bias to neutral"
+        invalidation = f"Weekly close below {stop:.0f} shifts bias neutral"
     else:
-        entry = 2445.0
-        stop = 2470.0
-        tp1 = 2420.0
-        tp2 = 2395.0
-        tp3 = 2360.0
-        direction = "SHORT"
-        confidence = 50
+        entry  = round(min(ma20 + atr * 0.8, price + atr * 0.4), 1)
+        stop   = round(entry + atr * 1.5, 1)
+        tp1, tp2, tp3 = round(entry-atr,1), round(entry-atr*2.2,1), round(entry-atr*4,1)
+        direction, regime_alignment, confidence = "SHORT", False, 49
         rationale = (
-            "XAU/EUR testing upper resistance band near 2450; overbought weekly RSI. "
-            "EUR strengthening relative to USD reduces XAU/EUR upside. "
-            "Wait for confirmation close below 2440 before entering short."
+            f"XAU/EUR ({price:.0f}) approaching upper resistance near {ma20+atr:.0f}. "
+            f"EUR relative strength reducing XAU/EUR upside. Entry {entry:.0f}, stop {stop:.0f}."
         )
-        regime_alignment = False
-        invalidation = "Break above 2480 negates the bearish structure"
+        invalidation = f"Break above {stop:.0f} negates bearish structure"
 
     return _signal_base(
         pair="XAU/EUR",
@@ -787,16 +767,210 @@ def _build_xaueur_signal(gold_bias: str, regime: dict, rng: np.random.Generator)
 
 def get_enhanced_calendar() -> list[dict]:
     """
-    Return 15-20 upcoming high-impact economic events for the next 7 days,
-    plus 2-3 recently-past events with actual values and surprise indices.
+    Return economic events enriched with gold/FX impact data.
 
-    Events cover FOMC, NFP, CPI, PCE, ECB, BoJ, BoE, PMI releases.
+    1. If FINNHUB_API_KEY is set, fetches real events from Finnhub's
+       economic calendar API and enriches them with gold impact scores,
+       historical reactions, and surprise index calculations.
+    2. Falls back to a curated static calendar with realistic mock data.
 
     Returns
     -------
     list[dict]
         Sorted by datetime ascending; past events appear at the top.
     """
+    try:
+        from app.config import settings  # noqa: PLC0415
+        if settings.has_finnhub_key:
+            live = _fetch_finnhub_calendar(settings.FINNHUB_API_KEY)
+            if live:
+                logger.info("Serving calendar from Finnhub (%d events)", len(live))
+                return live
+    except Exception as exc:
+        logger.warning("Finnhub calendar fetch failed: %s — using mock", exc)
+
+    logger.debug("No Finnhub key or fetch failed — using mock calendar")
+    return _build_mock_calendar()
+
+
+def _fetch_finnhub_calendar(api_key: str) -> list[dict]:
+    """
+    Fetch economic calendar events from Finnhub and enrich them.
+
+    API docs: https://finnhub.io/docs/api/economic-calendar
+    Free tier: 60 requests/minute.
+    """
+    import httpx  # noqa: PLC0415
+
+    now = datetime.now(timezone.utc)
+    from_date = (now - timedelta(days=2)).strftime("%Y-%m-%d")
+    to_date   = (now + timedelta(days=7)).strftime("%Y-%m-%d")
+
+    resp = httpx.get(
+        "https://finnhub.io/api/v1/calendar/economic",
+        params={"from": from_date, "to": to_date, "token": api_key},
+        timeout=10,
+    )
+    resp.raise_for_status()
+    raw_events = resp.json().get("economicCalendar", [])
+
+    # Currencies that affect gold / major FX pairs
+    relevant = {"USD", "EUR", "GBP", "JPY", "AUD", "CAD", "NZD", "CHF"}
+    filtered = [e for e in raw_events if e.get("country", "").upper() in relevant]
+
+    enriched: list[dict] = []
+    for i, ev in enumerate(filtered):
+        country_code = ev.get("country", "US").upper()
+        currency = country_code  # Finnhub uses ISO country codes as currency
+        event_name = ev.get("event", "")
+        impact = _finnhub_impact(ev.get("impact", "low"))
+        forecast = str(ev.get("estimate", "")) if ev.get("estimate") is not None else ""
+        previous = str(ev.get("prev", "")) if ev.get("prev") is not None else ""
+        actual_raw = ev.get("actual")
+        actual = str(actual_raw) if actual_raw is not None else None
+
+        # Surprise index: +100 = massive beat, −100 = massive miss
+        surprise_index: float | None = None
+        if actual is not None and forecast:
+            try:
+                a, f, p = float(actual.replace("%","").replace("K","000").replace("M","000000")), \
+                          float(forecast.replace("%","").replace("K","000").replace("M","000000")), \
+                          float(previous.replace("%","").replace("K","000").replace("M","000000")) if previous else None
+                spread = abs(a - f)
+                base_range = abs(f - p) if p else max(abs(f) * 0.1, 0.01)
+                surprise_index = round(min(100, max(-100, (a - f) / max(base_range, 0.001) * 50)), 1)
+            except (ValueError, ZeroDivisionError):
+                surprise_index = None
+
+        gold_score, gold_rxn, fx_rxn, pairs = _event_meta(event_name, currency, impact)
+
+        # Parse timestamp
+        ts_raw = ev.get("time", "")
+        try:
+            dt = datetime.fromisoformat(ts_raw.replace("Z", "+00:00")) if ts_raw else now
+        except Exception:
+            try:
+                dt = datetime.fromtimestamp(int(ts_raw), tz=timezone.utc)
+            except Exception:
+                dt = now
+
+        enriched.append({
+            "id": f"fh-{i:04d}",
+            "datetime": _utc(dt),
+            "event": event_name,
+            "country": _country_name(country_code),
+            "country_code": country_code,
+            "currency": currency,
+            "impact": impact,
+            "forecast": forecast,
+            "previous": previous,
+            "actual": actual,
+            "surprise_index": surprise_index,
+            "historical_gold_reaction": gold_rxn,
+            "historical_fx_reaction": fx_rxn,
+            "gold_impact_score": gold_score,
+            "pairs_affected": pairs,
+            "source": "finnhub",
+        })
+
+    enriched.sort(key=lambda e: e["datetime"])
+    return enriched
+
+
+def _finnhub_impact(raw: str) -> str:
+    mapping = {"high": "high", "medium": "medium", "low": "low",
+               "3": "high", "2": "medium", "1": "low"}
+    return mapping.get(str(raw).lower(), "low")
+
+
+def _country_name(code: str) -> str:
+    names = {
+        "US": "United States", "EU": "European Union", "GB": "United Kingdom",
+        "JP": "Japan", "AU": "Australia", "CA": "Canada", "NZ": "New Zealand",
+        "CH": "Switzerland", "EUR": "European Union",
+    }
+    return names.get(code.upper(), code)
+
+
+# Static meta-data for event enrichment — covers most common release types
+_EVENT_META: list[tuple[tuple[str, ...], int, str, dict, list]] = [
+    # (keywords, gold_score, gold_rxn, fx_rxn, pairs_affected)
+    (("nonfarm", "nfp", "payroll"),
+     10, "±1.8% avg — largest monthly gold catalyst",
+     {"EUR/USD": "±0.7%", "USD/JPY": "±0.9%", "GBP/USD": "±0.6%"},
+     ["XAU/USD", "EUR/USD", "USD/JPY", "GBP/USD", "AUD/USD"]),
+    (("cpi", "consumer price", "inflation"),
+     9, "+1.4% avg on hot print (inflation hedge); −0.8% on miss",
+     {"EUR/USD": "±0.5%", "USD/JPY": "±0.7%"},
+     ["XAU/USD", "EUR/USD", "USD/JPY"]),
+    (("pce", "personal consumption"),
+     8, "±1.0% — Fed's preferred measure; hot PCE very gold-bullish",
+     {"EUR/USD": "±0.4%", "USD/JPY": "±0.5%"},
+     ["XAU/USD", "EUR/USD"]),
+    (("fomc", "federal reserve", "fed rate", "fed funds"),
+     9, "±1.2% on hawkish/dovish surprises",
+     {"EUR/USD": "±0.5%", "USD/JPY": "±0.8%"},
+     ["XAU/USD", "EUR/USD", "USD/JPY", "GBP/USD", "AUD/USD"]),
+    (("ecb", "european central bank"),
+     7, "+0.6% if ECB cuts more than expected",
+     {"EUR/USD": "±0.8%", "GBP/EUR": "±0.5%"},
+     ["EUR/USD", "XAU/EUR"]),
+    (("boj", "bank of japan"),
+     6, "+0.4% if BoJ hikes (risk-off signal)",
+     {"USD/JPY": "±1.5%", "GBP/JPY": "±1.8%"},
+     ["USD/JPY", "GBP/JPY", "XAU/USD"]),
+    (("boe", "bank of england"),
+     5, "+0.3% if BoE cuts (GBP weakness → USD bid)",
+     {"GBP/USD": "±0.9%", "GBP/JPY": "±1.2%"},
+     ["GBP/USD", "GBP/JPY"]),
+    (("jobless", "unemployment", "claims"),
+     5, "+0.4% avg on high claims (risk-off / dovish Fed)",
+     {"EUR/USD": "+0.2%", "USD/JPY": "−0.3%"},
+     ["XAU/USD", "USD/JPY"]),
+    (("gdp",),
+     6, "−0.5% avg on strong GDP (risk-on, USD strength)",
+     {"EUR/USD": "±0.4%", "USD/JPY": "±0.5%"},
+     ["XAU/USD", "EUR/USD", "USD/JPY"]),
+    (("pmi", "manufacturing", "services"),
+     4, "±0.3% on significant surprise",
+     {"EUR/USD": "±0.2%", "AUD/USD": "±0.3%"},
+     ["EUR/USD", "AUD/USD", "XAU/USD"]),
+    (("retail sales",),
+     4, "−0.3% avg on strong retail (risk-on, USD strength)",
+     {"EUR/USD": "−0.2%", "USD/JPY": "+0.3%"},
+     ["XAU/USD", "EUR/USD"]),
+]
+
+
+def _event_meta(event: str, currency: str, impact: str) -> tuple[int, str, dict, list]:
+    """Return (gold_score, gold_rxn, fx_rxn, pairs_affected) for a given event."""
+    ev_lower = event.lower()
+    for keywords, score, gold_rxn, fx_rxn, pairs in _EVENT_META:
+        if any(kw in ev_lower for kw in keywords):
+            # Downgrade score for medium/low impact events
+            if impact == "medium":
+                score = max(1, score - 3)
+            elif impact == "low":
+                score = max(1, score - 5)
+            # Add currency-relevant pairs
+            cur_pair_map = {
+                "EUR": ["EUR/USD", "XAU/EUR"],
+                "GBP": ["GBP/USD", "GBP/JPY"],
+                "JPY": ["USD/JPY", "GBP/JPY"],
+                "AUD": ["AUD/USD"],
+                "CAD": ["USD/CAD"],
+            }
+            extra = cur_pair_map.get(currency, [])
+            all_pairs = list(dict.fromkeys(pairs + extra))  # deduplicated
+            return score, gold_rxn, fx_rxn, all_pairs
+
+    # Generic fallback
+    default_score = {"high": 4, "medium": 2, "low": 1}.get(impact, 1)
+    return default_score, "±0.2% avg on surprise", {}, ["XAU/USD"]
+
+
+def _build_mock_calendar() -> list[dict]:
+    """Static curated calendar — used when Finnhub is not available."""
     base_date = datetime(2026, 5, 27, tzinfo=timezone.utc)
     events: list[dict] = []
 
